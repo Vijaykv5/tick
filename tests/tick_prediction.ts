@@ -280,7 +280,7 @@ describe('tick_prediction', () => {
     await program.methods
       .claimPayout()
       .accounts({
-        claimant: user.publicKey,
+        authority,
         claimantTokenAccount: userUsdc,
         pool,
         prediction,
@@ -290,7 +290,6 @@ describe('tick_prediction', () => {
         vault,
         vaultAuthority,
       })
-      .signers([user])
       .rpc()
 
     const userAfter = await getAccount(provider.connection, userUsdc)
@@ -302,7 +301,7 @@ describe('tick_prediction', () => {
       program.methods
         .claimPayout()
         .accounts({
-          claimant: user.publicKey,
+          authority,
           claimantTokenAccount: userUsdc,
           pool,
           prediction,
@@ -312,7 +311,6 @@ describe('tick_prediction', () => {
           vault,
           vaultAuthority,
         })
-        .signers([user])
         .rpc(),
       'expected second claim to fail',
     )
@@ -356,7 +354,7 @@ describe('tick_prediction', () => {
       program.methods
         .claimPayout()
         .accounts({
-          claimant: user.publicKey,
+          authority,
           claimantTokenAccount: userUsdc,
           pool,
           prediction,
@@ -366,7 +364,6 @@ describe('tick_prediction', () => {
           vault,
           vaultAuthority,
         })
-        .signers([user])
         .rpc(),
       'expected loser claim to fail',
     )

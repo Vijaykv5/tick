@@ -85,6 +85,10 @@ function userTokenAccount(ownerAddress: string, mintAddress: string) {
   return getAssociatedTokenAddressSync(new PublicKey(mintAddress), new PublicKey(ownerAddress), false, TOKEN_PROGRAM_ID)
 }
 
+export function getUserTokenAccountAddress(ownerAddress: string, mintAddress: string) {
+  return userTokenAccount(ownerAddress, mintAddress).toString()
+}
+
 function web3InstructionToKitInstruction(instruction: TransactionInstruction): Instruction {
   return {
     programAddress: toAddress(instruction.programId),
@@ -280,16 +284,19 @@ export function getSettleRoundInstruction({
 }
 
 export function getClaimPayoutInstruction({
+  authorityAddress,
   claimantAddress,
   roundId,
   symbol,
   usdcMintAddress,
 }: {
+  authorityAddress: string
   claimantAddress: string
   roundId: bigint
   symbol: string
   usdcMintAddress: string
 }): Instruction {
+  const authority = new PublicKey(authorityAddress)
   const claimant = new PublicKey(claimantAddress)
   const usdcMint = new PublicKey(usdcMintAddress)
   const pool = poolPda(symbol)
@@ -307,7 +314,7 @@ export function getClaimPayoutInstruction({
       meta(prediction, AccountRole.WRITABLE),
       meta(vaultAuthority, AccountRole.READONLY),
       meta(vault, AccountRole.WRITABLE),
-      meta(claimant, AccountRole.WRITABLE_SIGNER),
+      meta(authority, AccountRole.READONLY_SIGNER),
       meta(claimantTokenAccount, AccountRole.WRITABLE),
       meta(usdcMint, AccountRole.READONLY),
       meta(TOKEN_PROGRAM_ID, AccountRole.READONLY),

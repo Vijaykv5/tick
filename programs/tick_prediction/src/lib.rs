@@ -168,6 +168,10 @@ pub mod tick_prediction {
             ctx.accounts.claimant_token_account.mint == ctx.accounts.pool.usdc_mint,
             TickError::InvalidMint
         );
+        require!(
+            ctx.accounts.claimant_token_account.owner == ctx.accounts.prediction.predictor,
+            TickError::InvalidClaimantTokenAccount
+        );
 
         let payout_amount = ctx
             .accounts
@@ -308,6 +312,7 @@ pub struct SettleRound<'info> {
 
 #[derive(Accounts)]
 pub struct ClaimPayout<'info> {
+    #[account(has_one = authority)]
     pub pool: Account<'info, Pool>,
     #[account(
         seeds = [b"round", round.pool.as_ref(), &round.round_id.to_le_bytes()],
@@ -317,7 +322,7 @@ pub struct ClaimPayout<'info> {
     pub round: Account<'info, Round>,
     #[account(
         mut,
-        seeds = [b"prediction", round.key().as_ref(), claimant.key().as_ref()],
+        seeds = [b"prediction", round.key().as_ref(), prediction.predictor.as_ref()],
         bump = prediction.bump,
         has_one = round
     )]
@@ -330,8 +335,7 @@ pub struct ClaimPayout<'info> {
     pub vault_authority: UncheckedAccount<'info>,
     #[account(mut)]
     pub vault: Account<'info, TokenAccount>,
-    #[account(mut)]
-    pub claimant: Signer<'info>,
+    pub authority: Signer<'info>,
     #[account(mut)]
     pub claimant_token_account: Account<'info, TokenAccount>,
     pub usdc_mint: Account<'info, Mint>,
@@ -428,6 +432,8 @@ pub enum TickError {
     InvalidMint,
     #[msg("Pool vault is invalid")]
     InvalidVault,
+    #[msg("Claimant token account must belong to the prediction owner")]
+    InvalidClaimantTokenAccount,
     #[msg("Prediction did not hit the winning tile")]
     PredictionLost,
     #[msg("Payout has already been claimed")]

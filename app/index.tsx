@@ -2,7 +2,6 @@ import {
   AccessibilityInfo,
   Image,
   ImageSourcePropType,
-  Linking,
   Modal,
   Platform,
   Pressable,
@@ -27,7 +26,7 @@ import { appStyles } from '@/constants/app-styles'
 import { useMobileWallet } from '@wallet-ui/react-native-kit'
 import Clipboard from '@react-native-clipboard/clipboard'
 import { Ionicons } from '@expo/vector-icons'
-import { getSolscanAccountUrl, getWalletAddress, isWalletConnected, shortenAddress } from '@/utils/wallet'
+import { getWalletAddress, getWalletAvatar, isWalletConnected, shortenAddress } from '@/utils/wallet'
 import { address as solanaAddress, type Instruction } from '@solana/kit'
 import {
   getClaimPayoutInstruction,
@@ -37,6 +36,7 @@ import {
   getPlaceTilePredictionInstruction,
   getSettleRoundInstruction,
   getTickPredictionAddresses,
+  getUserTokenAccountAddress,
   TILE_MULTIPLIERS_BPS,
   TILE_STAKE_BASE_UNITS,
   TILE_STAKE_USDC,
@@ -52,6 +52,7 @@ import {
 import { AppConfig } from '@/constants/app-config'
 import { Buffer } from 'buffer'
 import * as Haptics from 'expo-haptics'
+import { lamportsToSol } from '@/utils/lamports-to-sol'
 
 type Pool = {
   accent: string
@@ -177,6 +178,17 @@ function formatRoundTimer(ms: number) {
   const minutes = Math.floor(totalSeconds / 60)
   const seconds = totalSeconds % 60
   return `${minutes}:${seconds.toString().padStart(2, '0')}`
+}
+
+function formatWalletTokenBalance(balance: number | null) {
+  if (balance === null) {
+    return '...'
+  }
+
+  return balance.toLocaleString('en-US', {
+    maximumFractionDigits: 3,
+    minimumFractionDigits: 3,
+  })
 }
 
 function getChartY(value: number, min: number, max: number) {
@@ -563,6 +575,10 @@ export default function HomeScreen() {
   const [reduceMotion, setReduceMotion] = useState(false)
   const [isWalletSheetOpen, setWalletSheetOpen] = useState(false)
   const [copyLabel, setCopyLabel] = useState('Copy Address')
+  const [walletSolBalance, setWalletSolBalance] = useState<number | null>(null)
+  const [walletUsdcBalance, setWalletUsdcBalance] = useState<number | null>(null)
+  const [walletBalanceLoading, setWalletBalanceLoading] = useState(false)
+  const [walletBalanceError, setWalletBalanceError] = useState('')
   const [selectedPool, setSelectedPool] = useState<Pool | null>(null)
   const [poolMarketData, setPoolMarketData] = useState<Partial<Record<Pool['id'], PoolMarketData>>>({})
   const [poolPredictions, setPoolPredictions] = useState<Partial<Record<Pool['id'], PoolPrediction>>>({})
@@ -738,6 +754,7 @@ export default function HomeScreen() {
 
   const address = getWalletAddress(account)
   const connected = isWalletConnected(account)
+  const walletAvatar = getWalletAvatar(address)
   const chartWidth = Math.max(300, Math.min(screenWidth - 20, 430))
   const chartPlotWidth = Math.max(224, chartWidth - CHART_AXIS_WIDTH)
   const selectedPoolMarketData = selectedPool ? poolMarketData[selectedPool.id] : undefined
@@ -784,6 +801,53 @@ export default function HomeScreen() {
     activePrediction && selectedPool
       ? getTilePriceRange(activePrediction.roundStartPrice, activePrediction.tileIndex, selectedPool.id)
       : null
+
+  useEffect(() => {
+    if (!isWalletSheetOpen || !connected || !address) {
+      setWalletSolBalance(null)
+      setWalletUsdcBalance(null)
+      setWalletBalanceLoading(false)
+      setWalletBalanceError('')
+      return
+    }
+
+    let mounted = true
+    setWalletBalanceLoading(true)
+    setWalletBalanceError('')
+
+    const solBalancePromise = client.rpc.getBalance(solanaAddress(address)).send()
+    const usdcBalancePromise = AppConfig.devnetUsdcMint
+      ? client.rpc
+          .getAccountInfo(solanaAddress(getUserTokenAccountAddress(address, AppConfig.devnetUsdcMint)), {
+            encoding: 'base64',
+          })
+          .send()
+      : Promise.resolve(null)
+
+    Promise.all([solBalancePromise, usdcBalancePromise])
+      .then(([solBalance, usdcAccount]) => {
+        if (mounted) {
+          setWalletSolBalance(lamportsToSol(solBalance.value))
+          setWalletUsdcBalance(usdcAccount?.value ? Number(getSplTokenAccountAmount(usdcAccount.value)) / 1_000_000 : 0)
+        }
+      })
+      .catch(() => {
+        if (mounted) {
+          setWalletBalanceError('Balance unavailable')
+          setWalletSolBalance(null)
+          setWalletUsdcBalance(null)
+        }
+      })
+      .finally(() => {
+        if (mounted) {
+          setWalletBalanceLoading(false)
+        }
+      })
+
+    return () => {
+      mounted = false
+    }
+  }, [address, client.rpc, connected, isWalletSheetOpen])
 
   useEffect(() => {
     if (!selectedPool || !activePrediction || !roundSettled || activePrediction.feedbackShown) {
@@ -866,10 +930,6 @@ export default function HomeScreen() {
     Clipboard.setString(address)
     setCopyLabel('Copied')
     setTimeout(() => setCopyLabel('Copy Address'), 1400)
-  }
-
-  function openSolscan() {
-    Linking.openURL(getSolscanAccountUrl(address))
   }
 
   function disconnectWallet() {
@@ -1089,6 +1149,7 @@ export default function HomeScreen() {
           symbol: activePool.symbol,
         }),
         getClaimPayoutInstruction({
+          authorityAddress: claimantAddress,
           claimantAddress,
           roundId: prediction.roundId,
           symbol: activePool.symbol,
@@ -1548,16 +1609,37 @@ export default function HomeScreen() {
                 <Text style={appStyles.sheetTitle}>{connected ? 'Wallet' : 'Connect Wallet'}</Text>
                 {connected ? (
                   <>
-                    <Text selectable style={appStyles.fullAddress}>
-                      {address}
-                    </Text>
-
-                    <Pressable accessibilityRole="button" onPress={copyAddress} style={appStyles.sheetAction}>
-                      <Text style={appStyles.sheetActionText}>{copyLabel}</Text>
-                    </Pressable>
-                    <Pressable accessibilityRole="link" onPress={openSolscan} style={appStyles.sheetAction}>
-                      <Text style={appStyles.sheetActionText}>View on Solscan</Text>
-                    </Pressable>
+                    <View style={appStyles.walletProfile}>
+                      <View style={[appStyles.walletProfileAvatar, walletAvatar]}>
+                        <Text style={appStyles.walletProfileAvatarText}>M</Text>
+                      </View>
+                      <View style={appStyles.walletProfileContent}>
+                        <Pressable
+                          accessibilityLabel={copyLabel === 'Copied' ? 'Wallet address copied' : 'Copy wallet address'}
+                          accessibilityRole="button"
+                          onPress={copyAddress}
+                          style={appStyles.walletAddressCopyRow}
+                        >
+                          <Text numberOfLines={1} style={appStyles.walletProfileAddress}>
+                            {shortenAddress(address)}
+                          </Text>
+                          <Ionicons
+                            color={copyLabel === 'Copied' ? '#b8ff66' : '#a9a9a9'}
+                            name={copyLabel === 'Copied' ? 'checkmark-outline' : 'copy-outline'}
+                            size={20}
+                          />
+                        </Pressable>
+                        <Text numberOfLines={1} adjustsFontSizeToFit style={appStyles.walletBalanceText}>
+                          SOL : {walletBalanceLoading ? '...' : formatWalletTokenBalance(walletSolBalance)}
+                        </Text>
+                        <Text numberOfLines={1} adjustsFontSizeToFit style={appStyles.walletBalanceSubText}>
+                          USDC : {walletBalanceLoading ? '...' : formatWalletTokenBalance(walletUsdcBalance)}
+                        </Text>
+                        {walletBalanceError ? (
+                          <Text style={appStyles.walletBalanceError}>{walletBalanceError}</Text>
+                        ) : null}
+                      </View>
+                    </View>
                     <Pressable
                       accessibilityRole="button"
                       onPress={disconnectWallet}
