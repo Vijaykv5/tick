@@ -174,7 +174,7 @@ describe('tick_prediction', () => {
     assert.equal(Number(vaultAfter.amount - vaultBefore.amount), 1_000_000)
     assert.equal(predictionAccount.tileIndex, 3)
     assert.equal(predictionAccount.stakeAmount.toNumber(), 1_000_000)
-    assert.equal(predictionAccount.multiplierBps, 10_000)
+    assert.equal(predictionAccount.multiplierBps, 1_000)
     assert.equal(predictionAccount.claimed, false)
   })
 
@@ -295,7 +295,7 @@ describe('tick_prediction', () => {
 
     const userAfter = await getAccount(provider.connection, userUsdc)
     const predictionAccount = await program.account.tilePrediction.fetch(prediction)
-    assert.equal(Number(userAfter.amount - userBeforeClaim.amount), 3_000_000)
+    assert.equal(Number(userAfter.amount - userBeforeClaim.amount), 1_300_000)
     assert.equal(predictionAccount.claimed, true)
 
     await expectRejects(

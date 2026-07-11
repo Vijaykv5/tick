@@ -13,6 +13,7 @@
     "ios": "expo run:ios",
     "lint": "expo lint --fix",
     "lint:check": "expo lint",
+    "postinstall": "node scripts/patch-expo-router-linking.js",
     "start": "expo start",
     "web": "expo start --web"
   },

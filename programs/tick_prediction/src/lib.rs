@@ -6,13 +6,13 @@ declare_id!("4gaZzuoNzEWUtRnLSFeHABQTn2hPxKy3V5qeVsUSYaJz");
 const SYMBOL_BYTES: usize = 8;
 const TILE_COUNT: usize = 9;
 const TILE_COUNT_U8: u8 = 9;
-const TILE_WIDTH_BPS: i64 = 10;
+const BTC_AXIS_RANGE: i64 = 1_000;
+const ETH_AXIS_RANGE: i64 = 200;
+const SOL_AXIS_RANGE: i64 = 20;
 const STAKE_AMOUNT: u64 = 1_000_000;
 const USDC_DECIMALS: u8 = 6;
 const POOL_SEED: &[u8] = b"pool_v2";
-const MULTIPLIER_BPS: [u32; TILE_COUNT] = [
-    30_000, 20_000, 12_500, 10_000, 5_000, 3_000, 2_500, 2_000, 1_500,
-];
+const MULTIPLIER_BPS: [u32; TILE_COUNT] = [3_000, 2_000, 1_250, 1_000, 500, 300, 250, 200, 150];
 
 #[program]
 pub mod tick_prediction {
@@ -75,7 +75,9 @@ pub mod tick_prediction {
         round.ends_at = ends_at;
         round.status = RoundStatus::Open;
         round.winning_tile_index = u8::MAX;
-        round.tile_width_bps = TILE_WIDTH_BPS;
+        round.tile_width_bps = price_axis_range(&ctx.accounts.pool.symbol)?
+            .checked_div(TILE_COUNT as i64)
+            .ok_or(TickError::MathOverflow)?;
         round.multipliers_bps = MULTIPLIER_BPS;
         round.bump = ctx.bumps.round;
 
@@ -142,7 +144,7 @@ pub mod tick_prediction {
         let round = &mut ctx.accounts.round;
         round.final_price = final_price;
         round.winning_tile_index =
-            price_to_tile_index(round.start_price, final_price, round.tile_width_bps)?;
+            price_to_tile_index(round.start_price, final_price, &ctx.accounts.pool.symbol)?;
         round.status = RoundStatus::Settled;
 
         Ok(())
@@ -174,7 +176,9 @@ pub mod tick_prediction {
             .checked_mul(ctx.accounts.prediction.multiplier_bps as u64)
             .ok_or(TickError::MathOverflow)?
             .checked_div(10_000)
-            .and_then(|profit_amount| profit_amount.checked_add(ctx.accounts.prediction.stake_amount))
+            .and_then(|profit_amount| {
+                profit_amount.checked_add(ctx.accounts.prediction.stake_amount)
+            })
             .ok_or(TickError::MathOverflow)?;
 
         require!(
@@ -446,22 +450,40 @@ fn symbol_to_bytes(symbol: &str) -> Result<[u8; SYMBOL_BYTES]> {
     Ok(bytes)
 }
 
-fn price_to_tile_index(start_price: i64, final_price: i64, tile_width_bps: i64) -> Result<u8> {
+fn price_axis_range(symbol: &[u8; SYMBOL_BYTES]) -> Result<i64> {
+    if symbol.starts_with(b"BTC") {
+        return Ok(BTC_AXIS_RANGE);
+    }
+
+    if symbol.starts_with(b"ETH") {
+        return Ok(ETH_AXIS_RANGE);
+    }
+
+    if symbol.starts_with(b"SOL") {
+        return Ok(SOL_AXIS_RANGE);
+    }
+
+    err!(TickError::UnsupportedSymbol)
+}
+
+fn price_to_tile_index(
+    start_price: i64,
+    final_price: i64,
+    symbol: &[u8; SYMBOL_BYTES],
+) -> Result<u8> {
     require!(start_price > 0 && final_price > 0, TickError::InvalidPrice);
-    require!(tile_width_bps > 0, TickError::InvalidTile);
-
-    let delta_bps = final_price
-        .checked_sub(start_price)
-        .ok_or(TickError::MathOverflow)?
-        .checked_mul(10_000)
-        .ok_or(TickError::MathOverflow)?
-        .checked_div(start_price)
+    let axis_range = price_axis_range(symbol)?;
+    let min_price = start_price
+        .checked_sub(axis_range.checked_div(2).ok_or(TickError::MathOverflow)?)
         .ok_or(TickError::MathOverflow)?;
-    let centered_index = delta_bps
-        .checked_div(tile_width_bps)
+    let offset = final_price
+        .checked_sub(min_price)
+        .ok_or(TickError::MathOverflow)?;
+    let raw_index = offset
+        .checked_mul(TILE_COUNT as i64)
         .ok_or(TickError::MathOverflow)?
-        .checked_add(4)
+        .checked_div(axis_range)
         .ok_or(TickError::MathOverflow)?;
 
-    Ok(centered_index.clamp(0, (TILE_COUNT - 1) as i64) as u8)
+    Ok(raw_index.clamp(0, (TILE_COUNT - 1) as i64) as u8)
 }

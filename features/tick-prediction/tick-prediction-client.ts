@@ -19,7 +19,7 @@ export const DEFAULT_ROUND_DURATION_SECONDS = 60n
 export const DEFAULT_PREDICTION_WINDOW_SECONDS = 30n
 export const TILE_STAKE_USDC = 1
 export const TILE_STAKE_BASE_UNITS = 1_000_000n
-export const TILE_MULTIPLIERS_BPS = [30_000, 20_000, 12_500, 10_000, 5_000, 3_000, 2_500, 2_000, 1_500] as const
+export const TILE_MULTIPLIERS_BPS = [3_000, 2_000, 1_250, 1_000, 500, 300, 250, 200, 150] as const
 export const POOL_SEED = 'pool_v2'
 
 const coder = new BorshInstructionCoder(TICK_PREDICTION_IDL as unknown as Idl)

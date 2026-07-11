@@ -32,6 +32,7 @@ const POOL_BY_BINANCE_SYMBOL = Object.entries(BINANCE_SYMBOL_BY_POOL).reduce<Rec
 const BINANCE_REST_ENDPOINT = 'https://api.binance.com'
 const BINANCE_WS_ENDPOINT = 'wss://stream.binance.com:9443/stream'
 const CHART_POINT_LIMIT = 720
+const ONE_SECOND_MS = 1_000
 
 type BinanceKline = [number, string, string, string, string, string, number, string, number, string, string, string]
 
@@ -52,7 +53,15 @@ function parsePrice(value: string | undefined): number | null {
 }
 
 export function appendPricePoint(points: BinanceChartPoint[], point: BinanceChartPoint, limit = CHART_POINT_LIMIT) {
-  const nextPoints = [...points, point]
+  const secondPoint = {
+    ...point,
+    timestamp: Math.floor(point.timestamp / ONE_SECOND_MS) * ONE_SECOND_MS,
+  }
+  const lastPoint = points[points.length - 1]
+  const nextPoints =
+    lastPoint && lastPoint.timestamp === secondPoint.timestamp
+      ? [...points.slice(0, -1), secondPoint]
+      : [...points, secondPoint]
 
   if (nextPoints.length <= limit) {
     return nextPoints

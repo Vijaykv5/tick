@@ -13,7 +13,7 @@ import {
   View,
 } from 'react-native'
 import { SafeAreaView } from 'react-native-safe-area-context'
-import React, { useEffect, useRef, useState } from 'react'
+import React, { useCallback, useEffect, useState } from 'react'
 import Animated, {
   Easing,
   useAnimatedStyle,
@@ -98,6 +98,7 @@ const POOLS: Pool[] = [
 ]
 
 type PoolPrediction = {
+  autoClaimStarted?: boolean
   claimed?: boolean
   feedbackShown?: boolean
   multiplierBps: number
@@ -138,12 +139,16 @@ const CHART_AXIS_WIDTH = 70
 const ROUND_DURATION_MS = 60_000
 const PREDICTION_WINDOW_MS = 30_000
 const FALLBACK_POINT_STEP_MS = 1_000
-const TILE_WIDTH_BPS = 10
-const TILE_BUTTON_HEIGHT = 24
-const TILE_BUTTON_GAP = 3
+const TILE_SIZE = 24
+const TILE_BUTTON_GAP = 2
 const RESULT_FEEDBACK_MS = 2000
 const WIN_VIBRATION_PATTERN = [0, 420, 220, 420, 220, 420, 300]
 const LOSE_VIBRATION_PATTERN = [0, 180, 120, 180, 120, 180, 1220]
+const PRICE_AXIS_RANGE_BY_POOL: Record<Pool['id'], number> = {
+  btc: 10,
+  eth: 2,
+  sol: 0.2,
+}
 
 function formatPoolPrice(value: number) {
   return `$${value.toLocaleString('en-US', {
@@ -264,29 +269,6 @@ function roundPathValue(value: number) {
   return Number(value.toFixed(2))
 }
 
-function getCubicPoint(
-  start: ChartPathPoint,
-  controlOne: ChartPathPoint,
-  controlTwo: ChartPathPoint,
-  end: ChartPathPoint,
-  t: number,
-) {
-  const inverseT = 1 - t
-
-  return {
-    x:
-      inverseT ** 3 * start.x +
-      3 * inverseT ** 2 * t * controlOne.x +
-      3 * inverseT * t ** 2 * controlTwo.x +
-      t ** 3 * end.x,
-    y:
-      inverseT ** 3 * start.y +
-      3 * inverseT ** 2 * t * controlOne.y +
-      3 * inverseT * t ** 2 * controlTwo.y +
-      t ** 3 * end.y,
-  }
-}
-
 function getLineSegment(start: ChartPathPoint, end: ChartPathPoint): ChartSegment | null {
   const length = Math.hypot(end.x - start.x, end.y - start.y)
 
@@ -302,63 +284,37 @@ function getLineSegment(start: ChartPathPoint, end: ChartPathPoint): ChartSegmen
   }
 }
 
-function getSmoothChartSegments(points: ChartPathPoint[]) {
-  const segments: ChartSegment[] = []
-
-  if (points.length < 2) {
-    return segments
-  }
-
-  const smoothing = 0.72
-
-  for (let index = 0; index < points.length - 1; index += 1) {
-    const previousPoint = points[index - 1] ?? points[index]
-    const currentPoint = points[index]
-    const nextPoint = points[index + 1]
-    const followingPoint = points[index + 2] ?? nextPoint
-    const controlOne = {
-      x: clamp(currentPoint.x + ((nextPoint.x - previousPoint.x) / 6) * smoothing, currentPoint.x, nextPoint.x),
-      y: clamp(currentPoint.y + ((nextPoint.y - previousPoint.y) / 6) * smoothing, 0, CHART_HEIGHT),
-    }
-    const controlTwo = {
-      x: clamp(nextPoint.x - ((followingPoint.x - currentPoint.x) / 6) * smoothing, currentPoint.x, nextPoint.x),
-      y: clamp(nextPoint.y - ((followingPoint.y - currentPoint.y) / 6) * smoothing, 0, CHART_HEIGHT),
-    }
-    const sampleCount = Math.max(4, Math.ceil((nextPoint.x - currentPoint.x) / 6))
-    let previousSample = currentPoint
-
-    for (let sample = 1; sample <= sampleCount; sample += 1) {
-      const nextSample = getCubicPoint(currentPoint, controlOne, controlTwo, nextPoint, sample / sampleCount)
-      const segment = getLineSegment(previousSample, nextSample)
-
-      if (segment) {
-        segments.push(segment)
-      }
-
-      previousSample = nextSample
-    }
-  }
-
-  return segments
+function getPoolPriceAxisRange(poolId: Pool['id']) {
+  return PRICE_AXIS_RANGE_BY_POOL[poolId]
 }
 
-function getChartPriceRange(values: BinanceChartPoint[], currentPrice: number, poolId?: Pool['id']) {
+function getChartPriceRange(
+  values: BinanceChartPoint[],
+  currentPrice: number,
+  poolId?: Pool['id'],
+  centerPrice?: number,
+) {
+  if (poolId) {
+    const visibleRange = getPoolPriceAxisRange(poolId)
+    const center = centerPrice ?? currentPrice
+
+    return {
+      max: center + visibleRange / 2,
+      min: center - visibleRange / 2,
+    }
+  }
+
   const prices = values.map((point) => point.price)
   const minPrice = prices.length ? Math.min(...prices, currentPrice) : currentPrice
   const maxPrice = prices.length ? Math.max(...prices, currentPrice) : currentPrice
-  const minRangeByPool: Record<Pool['id'], number> = {
-    btc: 10,
-    eth: 2,
-    sol: 0.2,
-  }
-  const minRange = minRangeByPool[poolId ?? 'btc']
+  const minRange = getPoolPriceAxisRange('btc')
   const visibleRange = Math.max(maxPrice - minPrice, minRange)
-  const centerPrice = (minPrice + maxPrice) / 2
+  const fallbackCenterPrice = (minPrice + maxPrice) / 2
   const padding = visibleRange * 0.08
 
   return {
-    max: centerPrice + visibleRange / 2 + padding,
-    min: centerPrice - visibleRange / 2 - padding,
+    max: fallbackCenterPrice + visibleRange / 2 + padding,
+    min: fallbackCenterPrice - visibleRange / 2 - padding,
   }
 }
 
@@ -374,7 +330,17 @@ function getLiveChartSegments(
   roundStartMs: number,
 ) {
   const pathPoints = getChartPathPoints(points, width, min, max, roundStartMs)
-  return getSmoothChartSegments(pathPoints)
+  const segments: ChartSegment[] = []
+
+  for (let index = 0; index < pathPoints.length - 1; index += 1) {
+    const segment = getLineSegment(pathPoints[index], pathPoints[index + 1])
+
+    if (segment) {
+      segments.push(segment)
+    }
+  }
+
+  return segments
 }
 
 function getAxisPrices(min: number, max: number) {
@@ -407,30 +373,120 @@ function getPayoutBaseUnits(multiplierBps: number) {
   return TILE_STAKE_BASE_UNITS + (TILE_STAKE_BASE_UNITS * BigInt(multiplierBps)) / 10_000n
 }
 
-function getTileIndexFromPrice(startPrice: number, finalPrice: number) {
-  const deltaBps = ((finalPrice - startPrice) / startPrice) * 10_000
-  return Math.max(0, Math.min(TILE_MULTIPLIERS_BPS.length - 1, Math.trunc(deltaBps / TILE_WIDTH_BPS) + 4))
+function getTileIndexFromPrice(startPrice: number, finalPrice: number, poolId: Pool['id']) {
+  const axisRange = getPoolPriceAxisRange(poolId)
+  const minPrice = startPrice - axisRange / 2
+  const rawTileIndex = Math.floor(((finalPrice - minPrice) * TILE_MULTIPLIERS_BPS.length) / axisRange)
+
+  return Math.max(0, Math.min(TILE_MULTIPLIERS_BPS.length - 1, rawTileIndex))
+}
+
+function getTilePriceRange(startPrice: number, tileIndex: number, poolId: Pool['id']) {
+  const axisRange = getPoolPriceAxisRange(poolId)
+  const minPrice = startPrice - axisRange / 2
+  const lower = minPrice + (axisRange * tileIndex) / TILE_MULTIPLIERS_BPS.length
+  const upper = minPrice + (axisRange * (tileIndex + 1)) / TILE_MULTIPLIERS_BPS.length
+
+  return {
+    lower,
+    upper,
+  }
+}
+
+function getTileAxisPrice(startPrice: number, tileIndex: number, poolId: Pool['id']) {
+  const range = getTilePriceRange(startPrice, tileIndex, poolId)
+
+  if (typeof range.lower === 'number' && typeof range.upper === 'number') {
+    return (range.lower + range.upper) / 2
+  }
+
+  if (typeof range.lower === 'number') {
+    return range.lower
+  }
+
+  if (typeof range.upper === 'number') {
+    return range.upper
+  }
+
+  return startPrice
 }
 
 function getPredictionEndsAtMs(prediction?: PoolPrediction) {
   return prediction ? Number(prediction.roundId) + ROUND_DURATION_MS : null
 }
 
-function getTileLayout(
-  tileIndex: number,
-  phaseBoundaryX: number,
+function getTileLayouts(
   chartPlotWidth: number,
+  chartMin: number,
+  chartMax: number,
+  roundStartPrice: number,
+  poolId: Pool['id'],
 ) {
-  const tileWidth = Math.max(76, chartPlotWidth - phaseBoundaryX - 18)
-  const ladderHeight = TILE_MULTIPLIERS_BPS.length * TILE_BUTTON_HEIGHT + (TILE_MULTIPLIERS_BPS.length - 1) * TILE_BUTTON_GAP
-  const topOffset = Math.max(CHART_PADDING + 6, (CHART_HEIGHT - ladderHeight) / 2)
+  const tileWidth = TILE_SIZE
+  const minTop = 6
+  const maxTop = CHART_HEIGHT - TILE_SIZE - 6
+  const orderedLayouts = TILE_MULTIPLIERS_BPS.map((_, tileIndex) => ({
+    tileIndex,
+    top: clamp(
+      getChartY(getTileAxisPrice(roundStartPrice, tileIndex, poolId), chartMin, chartMax) - TILE_SIZE / 2,
+      minTop,
+      maxTop,
+    ),
+  })).sort((layoutA, layoutB) => layoutA.top - layoutB.top)
 
-  return {
-    height: TILE_BUTTON_HEIGHT,
-    left: phaseBoundaryX + 10,
-    top: topOffset + tileIndex * (TILE_BUTTON_HEIGHT + TILE_BUTTON_GAP),
-    width: tileWidth,
+  for (let index = 1; index < orderedLayouts.length; index += 1) {
+    orderedLayouts[index].top = Math.max(
+      orderedLayouts[index].top,
+      orderedLayouts[index - 1].top + TILE_SIZE + TILE_BUTTON_GAP,
+    )
   }
+
+  const overflow = orderedLayouts[orderedLayouts.length - 1].top - maxTop
+
+  if (overflow > 0) {
+    for (const layout of orderedLayouts) {
+      layout.top -= overflow
+    }
+
+    orderedLayouts[0].top = Math.max(orderedLayouts[0].top, minTop)
+
+    for (let index = 1; index < orderedLayouts.length; index += 1) {
+      orderedLayouts[index].top = Math.max(
+        orderedLayouts[index].top,
+        orderedLayouts[index - 1].top + TILE_SIZE + TILE_BUTTON_GAP,
+      )
+    }
+  }
+
+  return orderedLayouts.reduce<Record<number, { height: number; left: number; top: number; width: number }>>(
+    (layoutsByTile, layout) => ({
+      ...layoutsByTile,
+      [layout.tileIndex]: {
+        height: TILE_SIZE,
+        left: chartPlotWidth - TILE_SIZE - 10,
+        top: layout.top,
+        width: tileWidth,
+      },
+    }),
+    {},
+  )
+}
+
+function clearPoolPrediction(
+  setPoolPredictions: React.Dispatch<React.SetStateAction<Partial<Record<Pool['id'], PoolPrediction>>>>,
+  poolId: Pool['id'],
+  roundId: bigint,
+) {
+  setPoolPredictions((predictions) => {
+    if (predictions[poolId]?.roundId !== roundId) {
+      return predictions
+    }
+
+    return {
+      ...predictions,
+      [poolId]: undefined,
+    }
+  })
 }
 
 function getPredictionRouteLabel() {
@@ -440,6 +496,18 @@ function getPredictionRouteLabel() {
 function isUserCancelledError(error: unknown) {
   const message = error instanceof Error ? error.message : String(error)
   return /cancel|reject|declin|user.*denied|authorization.*failed/i.test(message)
+}
+
+function getPoolStartPrice(price: number) {
+  return BigInt(Math.max(1, Math.round(price * 100)))
+}
+
+function getConfiguredUsdcMint() {
+  if (!AppConfig.devnetUsdcMint) {
+    throw new Error('Set EXPO_PUBLIC_DEVNET_USDC_MINT to your devnet USDC mint before placing $1 tile predictions.')
+  }
+
+  return AppConfig.devnetUsdcMint
 }
 
 function getBase64AccountData(accountInfo: unknown) {
@@ -509,7 +577,6 @@ export default function HomeScreen() {
   const ickOpacity = useSharedValue(0)
   const ickRevealWidth = useSharedValue(0)
   const contentOpacity = useSharedValue(0)
-  const autoClaimStartedRoundRef = useRef<bigint | null>(null)
 
   useEffect(() => {
     AccessibilityInfo.isReduceMotionEnabled().then(setReduceMotion)
@@ -684,7 +751,12 @@ export default function HomeScreen() {
   const currentRoundStartPrice = selectedPoolChartPoints[0]?.price ?? selectedPoolPrice
   const roundStartPrice = activePrediction?.roundStartPrice ?? currentRoundStartPrice
   const chartRangeValues = getChartRangeValues(selectedPoolChartPoints)
-  const { max: chartMax, min: chartMin } = getChartPriceRange(chartRangeValues, selectedPoolPrice, selectedPool?.id)
+  const { max: chartMax, min: chartMin } = getChartPriceRange(
+    chartRangeValues,
+    selectedPoolPrice,
+    selectedPool?.id,
+    roundStartPrice,
+  )
   const currentLineY = selectedPool ? getChartY(selectedPoolPrice, chartMin, chartMax) : 0
   const chartSegments = getLiveChartSegments(selectedPoolChartPoints, chartPlotWidth, chartMin, chartMax, roundStartMs)
   const latestChartPoint = selectedPoolChartPoints[selectedPoolChartPoints.length - 1]
@@ -693,17 +765,25 @@ export default function HomeScreen() {
   const axisPrices = getAxisPrices(chartMin, chartMax)
   const axisTickSize = axisPrices.length > 1 ? Math.abs(axisPrices[0] - axisPrices[1]) : 0
   const phaseBoundaryX = chartPlotWidth / 2
+  const tileLayouts = selectedPool
+    ? getTileLayouts(chartPlotWidth, chartMin, chartMax, roundStartPrice, selectedPool.id)
+    : {}
   const activePredictionEndsAtMs = getPredictionEndsAtMs(activePrediction)
   const activePredictionSettled = activePredictionEndsAtMs !== null && nowMs >= activePredictionEndsAtMs
   const roundSettled = activePredictionSettled
   const settlementFinalPrice = activePrediction?.settledFinalPrice ?? selectedPoolPrice
   const winningTileIndex = roundSettled
-    ? (activePrediction?.winningTileIndex ?? getTileIndexFromPrice(roundStartPrice, settlementFinalPrice))
+    ? (activePrediction?.winningTileIndex ??
+      (selectedPool ? getTileIndexFromPrice(roundStartPrice, settlementFinalPrice, selectedPool.id) : null))
     : null
   const activePredictionWon =
     activePrediction && winningTileIndex !== null ? activePrediction.tileIndex === winningTileIndex : false
   const activePredictionPayout = activePrediction ? getPayoutAmount(activePrediction.multiplierBps) : 0
   const activePredictionPayoutBaseUnits = activePrediction ? getPayoutBaseUnits(activePrediction.multiplierBps) : 0n
+  const activePredictionCoreRange =
+    activePrediction && selectedPool
+      ? getTilePriceRange(activePrediction.roundStartPrice, activePrediction.tileIndex, selectedPool.id)
+      : null
 
   useEffect(() => {
     if (!selectedPool || !activePrediction || !roundSettled || activePrediction.feedbackShown) {
@@ -711,11 +791,11 @@ export default function HomeScreen() {
     }
 
     const settledFinalPrice = selectedPoolPrice
-    const settledWinningTileIndex = getTileIndexFromPrice(roundStartPrice, settledFinalPrice)
+    const settledWinningTileIndex = getTileIndexFromPrice(roundStartPrice, settledFinalPrice, selectedPool.id)
     const settledPredictionWon = activePrediction.tileIndex === settledWinningTileIndex
     const feedback: ResultFeedback = settledPredictionWon
       ? {
-          message: `You won ${formatUsdcAmount(activePredictionPayout)}. Tap CLAIM to get paid.`,
+          message: `You won ${formatUsdcAmount(activePredictionPayout)}. Sending the payout to your USDC account.`,
           title: 'Your tick won',
           type: 'win',
         }
@@ -725,17 +805,25 @@ export default function HomeScreen() {
           type: 'lose',
         }
 
-    setPoolPredictions((predictions) => ({
-      ...predictions,
-      [selectedPool.id]: {
-        ...activePrediction,
-        feedbackShown: true,
-        settledFinalPrice,
-        winningTileIndex: settledWinningTileIndex,
-      },
-    }))
+    setPoolPredictions((predictions) => {
+      const currentPrediction = predictions[selectedPool.id]
+
+      if (currentPrediction?.roundId !== activePrediction.roundId) {
+        return predictions
+      }
+
+      return {
+        ...predictions,
+        [selectedPool.id]: {
+          ...currentPrediction,
+          feedbackShown: true,
+          settledFinalPrice,
+          winningTileIndex: settledWinningTileIndex,
+        },
+      }
+    })
     setResultFeedback(feedback)
-    setPredictionStatus(settledPredictionWon ? 'Win locked. Tap CLAIM to send the payout to your USDC account.' : '')
+    setPredictionStatus(settledPredictionWon ? 'Win locked. Opening wallet to disburse your payout.' : '')
     playWebResultMusic(feedback.type)
 
     if (feedback.type === 'win') {
@@ -746,6 +834,19 @@ export default function HomeScreen() {
       Vibration.vibrate(LOSE_VIBRATION_PATTERN)
     }
   }, [activePrediction, activePredictionPayout, roundSettled, roundStartPrice, selectedPool, selectedPoolPrice])
+
+  useEffect(() => {
+    if (!selectedPool || !activePrediction?.feedbackShown || !roundSettled || activePredictionWon) {
+      return
+    }
+
+    const resetTimer = setTimeout(() => {
+      clearPoolPrediction(setPoolPredictions, selectedPool.id, activePrediction.roundId)
+      setPredictionStatus('')
+    }, RESULT_FEEDBACK_MS + 450)
+
+    return () => clearTimeout(resetTimer)
+  }, [activePrediction?.feedbackShown, activePrediction?.roundId, activePredictionWon, roundSettled, selectedPool])
 
   function openWalletAction() {
     setWalletSheetOpen(true)
@@ -774,18 +875,6 @@ export default function HomeScreen() {
   function disconnectWallet() {
     setWalletSheetOpen(false)
     disconnect()
-  }
-
-  function getPoolStartPrice(pool: Pool, price = poolMarketData[pool.id]?.price ?? pool.currentPrice) {
-    return BigInt(Math.max(1, Math.round(price * 100)))
-  }
-
-  function getConfiguredUsdcMint() {
-    if (!AppConfig.devnetUsdcMint) {
-      throw new Error('Set EXPO_PUBLIC_DEVNET_USDC_MINT to your devnet USDC mint before placing $1 tile predictions.')
-    }
-
-    return AppConfig.devnetUsdcMint
   }
 
   async function placeTilePrediction(tileIndex: number) {
@@ -830,7 +919,9 @@ export default function HomeScreen() {
       const roundAccount = await client.rpc
         .getAccountInfo(solanaAddress(addresses.round), { encoding: 'base64' })
         .send()
-      const usdcMintAccount = await client.rpc.getAccountInfo(solanaAddress(usdcMintAddress), { encoding: 'base64' }).send()
+      const usdcMintAccount = await client.rpc
+        .getAccountInfo(solanaAddress(usdcMintAddress), { encoding: 'base64' })
+        .send()
       const userUsdcAccount = addresses.predictorTokenAccount
         ? await client.rpc.getAccountInfo(solanaAddress(addresses.predictorTokenAccount), { encoding: 'base64' }).send()
         : null
@@ -881,7 +972,7 @@ export default function HomeScreen() {
             authorityAddress: predictorAddress,
             endsAt,
             roundId,
-            startPrice: getPoolStartPrice(activePool, roundStartPrice),
+            startPrice: getPoolStartPrice(roundStartPrice),
             startsAt,
             symbol: activePool.symbol,
           }),
@@ -909,7 +1000,9 @@ export default function HomeScreen() {
           tileIndex,
         },
       }))
-      setPredictionStatus(`Tile ${tileIndex + 1} placed for $1: ${shortenAddress(signature, 6)}`)
+      setPredictionStatus(
+        `${formatMultiplier(TILE_MULTIPLIERS_BPS[tileIndex])} placed for $1: ${shortenAddress(signature, 6)}`,
+      )
     } catch (error) {
       if (isUserCancelledError(error)) {
         return
@@ -922,11 +1015,17 @@ export default function HomeScreen() {
     }
   }
 
-  async function claimTilePayout() {
+  const claimTilePayout = useCallback(async () => {
     const activePool = selectedPool
     const prediction = activePrediction
 
-    if (!activePool || !prediction || !activePredictionWon || prediction.claimed || claimPendingRoundId === prediction.roundId) {
+    if (
+      !activePool ||
+      !prediction ||
+      !activePredictionWon ||
+      prediction.claimed ||
+      claimPendingRoundId === prediction.roundId
+    ) {
       return
     }
 
@@ -942,7 +1041,12 @@ export default function HomeScreen() {
         throw new Error('Wallet connection did not return an address.')
       }
 
-      const addresses = getTickPredictionAddresses(activePool.symbol, claimantAddress, prediction.roundId, usdcMintAddress)
+      const addresses = getTickPredictionAddresses(
+        activePool.symbol,
+        claimantAddress,
+        prediction.roundId,
+        usdcMintAddress,
+      )
       const userUsdcAccount = addresses.predictorTokenAccount
       const instructions: Instruction[] = []
 
@@ -964,7 +1068,9 @@ export default function HomeScreen() {
         )
       }
 
-      const vaultAccountInfo = await client.rpc.getAccountInfo(solanaAddress(addresses.vault), { encoding: 'base64' }).send()
+      const vaultAccountInfo = await client.rpc
+        .getAccountInfo(solanaAddress(addresses.vault), { encoding: 'base64' })
+        .send()
       const vaultBalance = getSplTokenAccountAmount(vaultAccountInfo.value)
 
       if (vaultBalance < activePredictionPayoutBaseUnits) {
@@ -978,7 +1084,7 @@ export default function HomeScreen() {
       instructions.push(
         getSettleRoundInstruction({
           authorityAddress: claimantAddress,
-          finalPrice: getPoolStartPrice(activePool, prediction.settledFinalPrice ?? selectedPoolPrice),
+          finalPrice: getPoolStartPrice(prediction.settledFinalPrice ?? selectedPoolPrice),
           roundId: prediction.roundId,
           symbol: activePool.symbol,
         }),
@@ -992,14 +1098,10 @@ export default function HomeScreen() {
 
       const signature = await sendTransactions(instructions)
 
-      setPoolPredictions((predictions) => ({
-        ...predictions,
-        [activePool.id]: {
-          ...prediction,
-          claimed: true,
-        },
-      }))
-      setPredictionStatus(`Claimed ${formatUsdcAmount(activePredictionPayout)}: ${shortenAddress(signature, 6)}`)
+      clearPoolPrediction(setPoolPredictions, activePool.id, prediction.roundId)
+      setPredictionStatus(
+        `Paid ${formatUsdcAmount(activePredictionPayout)} to your wallet: ${shortenAddress(signature, 6)}`,
+      )
     } catch (error) {
       if (isUserCancelledError(error)) {
         return
@@ -1010,27 +1112,53 @@ export default function HomeScreen() {
     } finally {
       setClaimPendingRoundId(null)
     }
-  }
+  }, [
+    account,
+    activePrediction,
+    activePredictionPayout,
+    activePredictionPayoutBaseUnits,
+    activePredictionWon,
+    claimPendingRoundId,
+    client.rpc,
+    connect,
+    selectedPool,
+    selectedPoolPrice,
+    sendTransactions,
+  ])
 
   useEffect(() => {
-    if (!selectedPool || !activePrediction || !activePredictionWon || activePrediction.claimed || activePrediction.autoClaimStarted) {
+    if (
+      !selectedPool ||
+      !activePrediction?.feedbackShown ||
+      !activePredictionWon ||
+      activePrediction.claimed ||
+      activePrediction.autoClaimStarted
+    ) {
       return
     }
 
-    setPoolPredictions((predictions) => ({
-      ...predictions,
-      [selectedPool.id]: {
-        ...activePrediction,
-        autoClaimStarted: true,
-      },
-    }))
+    setPoolPredictions((predictions) => {
+      const currentPrediction = predictions[selectedPool.id]
+
+      if (currentPrediction?.roundId !== activePrediction.roundId) {
+        return predictions
+      }
+
+      return {
+        ...predictions,
+        [selectedPool.id]: {
+          ...currentPrediction,
+          autoClaimStarted: true,
+        },
+      }
+    })
 
     const autoClaimTimer = setTimeout(() => {
       claimTilePayout()
     }, RESULT_FEEDBACK_MS + 250)
 
     return () => clearTimeout(autoClaimTimer)
-  }, [activePrediction, activePredictionWon, selectedPool])
+  }, [activePrediction, activePredictionWon, claimTilePayout, selectedPool])
 
   return (
     <SafeAreaView style={appStyles.screen}>
@@ -1127,12 +1255,22 @@ export default function HomeScreen() {
                       style={[
                         appStyles.priceChartFutureZone,
                         {
+                          backgroundColor: `${selectedPool.accent}24`,
+                          borderLeftColor: `${selectedPool.accent}70`,
                           left: phaseBoundaryX,
                           width: chartPlotWidth - phaseBoundaryX,
                         },
                       ]}
                     />
-                    <View style={[appStyles.priceChartPhaseDivider, { left: phaseBoundaryX }]} />
+                    <View
+                      style={[
+                        appStyles.priceChartPhaseDivider,
+                        {
+                          backgroundColor: selectedPool.accent,
+                          left: phaseBoundaryX,
+                        },
+                      ]}
+                    />
                     <Text
                       style={[
                         appStyles.priceChartLayerLabel,
@@ -1148,6 +1286,7 @@ export default function HomeScreen() {
                         appStyles.priceChartLayerLabel,
                         appStyles.priceChartLayerLabelRight,
                         {
+                          color: selectedPool.accent,
                           left: phaseBoundaryX + 12,
                         },
                       ]}
@@ -1210,27 +1349,31 @@ export default function HomeScreen() {
                       const tileSelected = activePrediction?.tileIndex === tileIndex
                       const tileWon = winningTileIndex === tileIndex && roundSettled
                       const tilePending = pendingTileIndex === tileIndex
+                      const tileLayout = tileLayouts[tileIndex]
                       const tileDisabled =
-                        !predictionOpen || Boolean(activePrediction && !activePredictionSettled) || pendingTileIndex !== null
+                        !predictionOpen ||
+                        Boolean(activePrediction && !activePredictionSettled) ||
+                        pendingTileIndex !== null
 
                       return (
                         <Pressable
-                          accessibilityLabel={`${formatMultiplier(multiplierBps)} tile`}
+                          accessibilityLabel={`${formatMultiplier(multiplierBps)} tile aligned to the right price axis`}
                           accessibilityRole="button"
                           disabled={tileDisabled}
                           key={`tile-${tileIndex}`}
                           onPress={() => placeTilePrediction(tileIndex)}
                           style={({ pressed }) => [
                             appStyles.tileButton,
-                            getTileLayout(TILE_MULTIPLIERS_BPS.length - 1 - tileIndex, phaseBoundaryX, chartPlotWidth),
+                            tileLayout,
                             pressed && appStyles.tileButtonPressed,
                             tileDisabled && !tileSelected && appStyles.tileButtonDisabled,
                             tileSelected && appStyles.tileButtonSelected,
                             tileWon && appStyles.tileButtonWinning,
                           ]}
                         >
-                          <Text style={appStyles.tileStakeText}>{tilePending ? '...' : '$1'}</Text>
-                          <Text style={appStyles.tileMultiplierText}>{formatMultiplier(multiplierBps)}</Text>
+                          <Text style={appStyles.tileMultiplierText}>
+                            {tilePending ? '...' : formatMultiplier(multiplierBps)}
+                          </Text>
                         </Pressable>
                       )
                     })}
@@ -1245,7 +1388,7 @@ export default function HomeScreen() {
                         ]}
                       >
                         <Text style={appStyles.priceChartPredictionText}>
-                          Tile {activePrediction.tileIndex + 1} {formatMultiplier(activePrediction.multiplierBps)}
+                          {formatMultiplier(activePrediction.multiplierBps)}
                         </Text>
                       </View>
                     ) : null}
@@ -1254,7 +1397,7 @@ export default function HomeScreen() {
                         appStyles.priceChartPriceTag,
                         {
                           backgroundColor: selectedPool.accent,
-                          right: CHART_AXIS_WIDTH - 8,
+                          right: 6,
                           top: currentLineY - 17,
                         },
                       ]}
@@ -1278,22 +1421,40 @@ export default function HomeScreen() {
                     </View>
                   </View>
                   {activePrediction ? (
-                    <View style={appStyles.tileResultCard}>
+                    <View
+                      style={[
+                        appStyles.tileResultCard,
+                        {
+                          backgroundColor: `${selectedPool.accent}24`,
+                          borderColor: selectedPool.accent,
+                        },
+                      ]}
+                    >
                       <View style={appStyles.tileResultTextGroup}>
-                        <Text style={appStyles.tileResultLabel}>
+                        <Text style={[appStyles.tileResultLabel, { color: selectedPool.accent }]}>
                           {roundSettled && activePredictionWon
                             ? activePrediction.claimed
-                              ? 'CLAIMED'
+                              ? 'PAID'
                               : 'WIN'
                             : roundSettled
-                              ? 'LOST'
+                              ? 'MISSED'
                               : predictionOpen
-                                ? 'PLACED'
+                                ? 'PREDICTION'
                                 : 'LOCKED'}
                         </Text>
                         <Text style={appStyles.tileResultValue}>
-                          Tile {activePrediction.tileIndex + 1} · {formatMultiplier(activePrediction.multiplierBps)} ·{' '}
-                          {formatUsdcAmount(activePredictionPayout)}
+                          {formatMultiplier(activePrediction.multiplierBps)}
+                        </Text>
+                        {activePredictionCoreRange ? (
+                          <Text style={appStyles.tileAxisRangeValue}>
+                            {formatAxisPrice(activePredictionCoreRange.lower, axisTickSize)} -{' '}
+                            {formatAxisPrice(activePredictionCoreRange.upper, axisTickSize)}
+                          </Text>
+                        ) : null}
+                      </View>
+                      <View style={appStyles.tileMultiplierBadge}>
+                        <Text style={appStyles.tileMultiplierBadgeText}>
+                          {formatMultiplier(activePrediction.multiplierBps)}
                         </Text>
                       </View>
                       {roundSettled && activePredictionWon && !activePrediction.claimed ? (
@@ -1302,7 +1463,9 @@ export default function HomeScreen() {
                           onPress={claimTilePayout}
                           style={({ pressed }) => [appStyles.claimButton, pressed && appStyles.buttonPressed]}
                         >
-                          <Text style={appStyles.claimButtonText}>CLAIM {formatUsdcAmount(activePredictionPayout)}</Text>
+                          <Text style={appStyles.claimButtonText}>
+                            CLAIM {formatUsdcAmount(activePredictionPayout)}
+                          </Text>
                         </Pressable>
                       ) : null}
                     </View>
