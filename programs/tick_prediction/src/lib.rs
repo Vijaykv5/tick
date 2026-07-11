@@ -1,8 +1,18 @@
 use anchor_lang::prelude::*;
+use anchor_spl::token::{self, Mint, Token, TokenAccount, TransferChecked};
 
 declare_id!("4gaZzuoNzEWUtRnLSFeHABQTn2hPxKy3V5qeVsUSYaJz");
 
 const SYMBOL_BYTES: usize = 8;
+const TILE_COUNT: usize = 9;
+const TILE_COUNT_U8: u8 = 9;
+const TILE_WIDTH_BPS: i64 = 10;
+const STAKE_AMOUNT: u64 = 1_000_000;
+const USDC_DECIMALS: u8 = 6;
+const POOL_SEED: &[u8] = b"pool_v2";
+const MULTIPLIER_BPS: [u32; TILE_COUNT] = [
+    30_000, 20_000, 12_500, 10_000, 5_000, 3_000, 2_500, 2_000, 1_500,
+];
 
 #[program]
 pub mod tick_prediction {
@@ -12,15 +22,29 @@ pub mod tick_prediction {
         ctx: Context<InitializePool>,
         symbol: String,
         duration_seconds: i64,
+        prediction_window_seconds: i64,
     ) -> Result<()> {
         require!(duration_seconds > 0, TickError::InvalidDuration);
+        require!(
+            prediction_window_seconds > 0 && prediction_window_seconds < duration_seconds,
+            TickError::InvalidPredictionWindow
+        );
+        require!(
+            ctx.accounts.usdc_mint.decimals == USDC_DECIMALS,
+            TickError::InvalidMint
+        );
         require!(is_supported_symbol(&symbol), TickError::UnsupportedSymbol);
 
         let pool = &mut ctx.accounts.pool;
         pool.authority = ctx.accounts.authority.key();
         pool.symbol = symbol_to_bytes(&symbol)?;
+        pool.usdc_mint = ctx.accounts.usdc_mint.key();
+        pool.vault = ctx.accounts.vault.key();
+        pool.vault_authority = ctx.accounts.vault_authority.key();
         pool.duration_seconds = duration_seconds;
+        pool.prediction_window_seconds = prediction_window_seconds;
         pool.bump = ctx.bumps.pool;
+        pool.vault_bump = ctx.bumps.vault_authority;
 
         Ok(())
     }
@@ -46,28 +70,141 @@ pub mod tick_prediction {
         round.pool = ctx.accounts.pool.key();
         round.round_id = round_id;
         round.start_price = start_price;
+        round.final_price = 0;
         round.starts_at = starts_at;
         round.ends_at = ends_at;
         round.status = RoundStatus::Open;
+        round.winning_tile_index = u8::MAX;
+        round.tile_width_bps = TILE_WIDTH_BPS;
+        round.multipliers_bps = MULTIPLIER_BPS;
         round.bump = ctx.bumps.round;
 
         Ok(())
     }
 
-    pub fn place_prediction(ctx: Context<PlacePrediction>, direction: Direction) -> Result<()> {
+    pub fn place_tile_prediction(ctx: Context<PlaceTilePrediction>, tile_index: u8) -> Result<()> {
         let now = Clock::get()?.unix_timestamp;
         let round = &ctx.accounts.round;
 
+        require!(tile_index < TILE_COUNT_U8, TickError::InvalidTile);
         require!(round.status == RoundStatus::Open, TickError::RoundNotOpen);
         require!(now >= round.starts_at, TickError::RoundNotStarted);
-        require!(now < round.ends_at, TickError::RoundClosed);
+        require!(
+            now < round.starts_at + ctx.accounts.pool.prediction_window_seconds,
+            TickError::PredictionWindowClosed
+        );
+        require!(
+            ctx.accounts.predictor_token_account.mint == ctx.accounts.pool.usdc_mint,
+            TickError::InvalidMint
+        );
+        require!(
+            ctx.accounts.vault.key() == ctx.accounts.pool.vault,
+            TickError::InvalidVault
+        );
+
+        token::transfer_checked(
+            CpiContext::new(
+                ctx.accounts.token_program.key(),
+                TransferChecked {
+                    from: ctx.accounts.predictor_token_account.to_account_info(),
+                    mint: ctx.accounts.usdc_mint.to_account_info(),
+                    to: ctx.accounts.vault.to_account_info(),
+                    authority: ctx.accounts.predictor.to_account_info(),
+                },
+            ),
+            STAKE_AMOUNT,
+            USDC_DECIMALS,
+        )?;
 
         let prediction = &mut ctx.accounts.prediction;
         prediction.round = round.key();
         prediction.predictor = ctx.accounts.predictor.key();
-        prediction.direction = direction;
+        prediction.tile_index = tile_index;
+        prediction.stake_amount = STAKE_AMOUNT;
+        prediction.multiplier_bps = round.multipliers_bps[tile_index as usize];
         prediction.created_at = now;
+        prediction.claimed = false;
         prediction.bump = ctx.bumps.prediction;
+
+        Ok(())
+    }
+
+    pub fn settle_round(ctx: Context<SettleRound>, final_price: i64) -> Result<()> {
+        require!(final_price > 0, TickError::InvalidPrice);
+        require!(
+            ctx.accounts.round.status == RoundStatus::Open,
+            TickError::RoundNotOpen
+        );
+
+        let now = Clock::get()?.unix_timestamp;
+        require!(now >= ctx.accounts.round.ends_at, TickError::RoundNotEnded);
+
+        let round = &mut ctx.accounts.round;
+        round.final_price = final_price;
+        round.winning_tile_index =
+            price_to_tile_index(round.start_price, final_price, round.tile_width_bps)?;
+        round.status = RoundStatus::Settled;
+
+        Ok(())
+    }
+
+    pub fn claim_payout(ctx: Context<ClaimPayout>) -> Result<()> {
+        require!(
+            ctx.accounts.round.status == RoundStatus::Settled,
+            TickError::RoundNotSettled
+        );
+        require!(!ctx.accounts.prediction.claimed, TickError::AlreadyClaimed);
+        require!(
+            ctx.accounts.prediction.tile_index == ctx.accounts.round.winning_tile_index,
+            TickError::PredictionLost
+        );
+        require!(
+            ctx.accounts.vault.key() == ctx.accounts.pool.vault,
+            TickError::InvalidVault
+        );
+        require!(
+            ctx.accounts.claimant_token_account.mint == ctx.accounts.pool.usdc_mint,
+            TickError::InvalidMint
+        );
+
+        let payout_amount = ctx
+            .accounts
+            .prediction
+            .stake_amount
+            .checked_mul(ctx.accounts.prediction.multiplier_bps as u64)
+            .ok_or(TickError::MathOverflow)?
+            .checked_div(10_000)
+            .and_then(|profit_amount| profit_amount.checked_add(ctx.accounts.prediction.stake_amount))
+            .ok_or(TickError::MathOverflow)?;
+
+        require!(
+            ctx.accounts.vault.amount >= payout_amount,
+            TickError::InsufficientVaultFunds
+        );
+
+        let pool_key = ctx.accounts.pool.key();
+        let signer_seeds: &[&[u8]] = &[
+            b"vault_authority",
+            pool_key.as_ref(),
+            &[ctx.accounts.pool.vault_bump],
+        ];
+
+        token::transfer_checked(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.key(),
+                TransferChecked {
+                    from: ctx.accounts.vault.to_account_info(),
+                    mint: ctx.accounts.usdc_mint.to_account_info(),
+                    to: ctx.accounts.claimant_token_account.to_account_info(),
+                    authority: ctx.accounts.vault_authority.to_account_info(),
+                },
+                &[signer_seeds],
+            ),
+            payout_amount,
+            USDC_DECIMALS,
+        )?;
+
+        ctx.accounts.prediction.claimed = true;
 
         Ok(())
     }
@@ -80,12 +217,29 @@ pub struct InitializePool<'info> {
         init,
         payer = authority,
         space = Pool::SPACE,
-        seeds = [b"pool", symbol.as_bytes()],
+        seeds = [POOL_SEED, symbol.as_bytes()],
         bump
     )]
     pub pool: Account<'info, Pool>,
+    /// CHECK: PDA authority for the pool token vault.
+    #[account(
+        seeds = [b"vault_authority", pool.key().as_ref()],
+        bump
+    )]
+    pub vault_authority: UncheckedAccount<'info>,
+    #[account(
+        init,
+        payer = authority,
+        token::mint = usdc_mint,
+        token::authority = vault_authority,
+        seeds = [b"vault", pool.key().as_ref()],
+        bump
+    )]
+    pub vault: Account<'info, TokenAccount>,
+    pub usdc_mint: Account<'info, Mint>,
     #[account(mut)]
     pub authority: Signer<'info>,
+    pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
 }
 
@@ -108,35 +262,93 @@ pub struct OpenRound<'info> {
 }
 
 #[derive(Accounts)]
-pub struct PlacePrediction<'info> {
+pub struct PlaceTilePrediction<'info> {
+    pub pool: Account<'info, Pool>,
     #[account(
         seeds = [b"round", round.pool.as_ref(), &round.round_id.to_le_bytes()],
-        bump = round.bump
+        bump = round.bump,
+        has_one = pool
     )]
     pub round: Account<'info, Round>,
     #[account(
         init,
         payer = predictor,
-        space = Prediction::SPACE,
+        space = TilePrediction::SPACE,
         seeds = [b"prediction", round.key().as_ref(), predictor.key().as_ref()],
         bump
     )]
-    pub prediction: Account<'info, Prediction>,
+    pub prediction: Account<'info, TilePrediction>,
     #[account(mut)]
     pub predictor: Signer<'info>,
+    #[account(mut)]
+    pub predictor_token_account: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub vault: Account<'info, TokenAccount>,
+    pub usdc_mint: Account<'info, Mint>,
+    pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct SettleRound<'info> {
+    pub pool: Account<'info, Pool>,
+    #[account(
+        mut,
+        seeds = [b"round", round.pool.as_ref(), &round.round_id.to_le_bytes()],
+        bump = round.bump,
+        has_one = pool
+    )]
+    pub round: Account<'info, Round>,
+    pub authority: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct ClaimPayout<'info> {
+    pub pool: Account<'info, Pool>,
+    #[account(
+        seeds = [b"round", round.pool.as_ref(), &round.round_id.to_le_bytes()],
+        bump = round.bump,
+        has_one = pool
+    )]
+    pub round: Account<'info, Round>,
+    #[account(
+        mut,
+        seeds = [b"prediction", round.key().as_ref(), claimant.key().as_ref()],
+        bump = prediction.bump,
+        has_one = round
+    )]
+    pub prediction: Account<'info, TilePrediction>,
+    /// CHECK: PDA authority for the pool token vault.
+    #[account(
+        seeds = [b"vault_authority", pool.key().as_ref()],
+        bump = pool.vault_bump
+    )]
+    pub vault_authority: UncheckedAccount<'info>,
+    #[account(mut)]
+    pub vault: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub claimant: Signer<'info>,
+    #[account(mut)]
+    pub claimant_token_account: Account<'info, TokenAccount>,
+    pub usdc_mint: Account<'info, Mint>,
+    pub token_program: Program<'info, Token>,
 }
 
 #[account]
 pub struct Pool {
     pub authority: Pubkey,
     pub symbol: [u8; SYMBOL_BYTES],
+    pub usdc_mint: Pubkey,
+    pub vault: Pubkey,
+    pub vault_authority: Pubkey,
     pub duration_seconds: i64,
+    pub prediction_window_seconds: i64,
     pub bump: u8,
+    pub vault_bump: u8,
 }
 
 impl Pool {
-    pub const SPACE: usize = 8 + 32 + SYMBOL_BYTES + 8 + 1;
+    pub const SPACE: usize = 8 + 32 + SYMBOL_BYTES + 32 + 32 + 32 + 8 + 8 + 1 + 1;
 }
 
 #[account]
@@ -144,38 +356,40 @@ pub struct Round {
     pub pool: Pubkey,
     pub round_id: u64,
     pub start_price: i64,
+    pub final_price: i64,
     pub starts_at: i64,
     pub ends_at: i64,
     pub status: RoundStatus,
+    pub winning_tile_index: u8,
+    pub tile_width_bps: i64,
+    pub multipliers_bps: [u32; TILE_COUNT],
     pub bump: u8,
 }
 
 impl Round {
-    pub const SPACE: usize = 8 + 32 + 8 + 8 + 8 + 8 + 1 + 1;
+    pub const SPACE: usize = 8 + 32 + 8 + 8 + 8 + 8 + 8 + 1 + 1 + 8 + 4 * TILE_COUNT + 1;
 }
 
 #[account]
-pub struct Prediction {
+pub struct TilePrediction {
     pub round: Pubkey,
     pub predictor: Pubkey,
-    pub direction: Direction,
+    pub tile_index: u8,
+    pub stake_amount: u64,
+    pub multiplier_bps: u32,
     pub created_at: i64,
+    pub claimed: bool,
     pub bump: u8,
 }
 
-impl Prediction {
-    pub const SPACE: usize = 8 + 32 + 32 + 1 + 8 + 1;
+impl TilePrediction {
+    pub const SPACE: usize = 8 + 32 + 32 + 1 + 8 + 4 + 8 + 1 + 1;
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq)]
 pub enum RoundStatus {
     Open,
-}
-
-#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq)]
-pub enum Direction {
-    Up,
-    Down,
+    Settled,
 }
 
 #[error_code]
@@ -184,7 +398,9 @@ pub enum TickError {
     UnsupportedSymbol,
     #[msg("Duration must be greater than zero")]
     InvalidDuration,
-    #[msg("Round start price must be greater than zero")]
+    #[msg("Prediction window must be greater than zero and less than duration")]
+    InvalidPredictionWindow,
+    #[msg("Round start/final price must be greater than zero")]
     InvalidPrice,
     #[msg("Round window must match the pool duration")]
     InvalidRoundWindow,
@@ -194,6 +410,28 @@ pub enum TickError {
     RoundClosed,
     #[msg("Round is not open")]
     RoundNotOpen,
+    #[msg("Round has not ended")]
+    RoundNotEnded,
+    #[msg("Round is not settled")]
+    RoundNotSettled,
+    #[msg("Tile index is invalid")]
+    InvalidTile,
+    #[msg("Prediction window is closed")]
+    PredictionWindowClosed,
+    #[msg("Only the pool authority can perform this action")]
+    Unauthorized,
+    #[msg("USDC mint is invalid")]
+    InvalidMint,
+    #[msg("Pool vault is invalid")]
+    InvalidVault,
+    #[msg("Prediction did not hit the winning tile")]
+    PredictionLost,
+    #[msg("Payout has already been claimed")]
+    AlreadyClaimed,
+    #[msg("Vault does not have enough funds")]
+    InsufficientVaultFunds,
+    #[msg("Math overflow")]
+    MathOverflow,
 }
 
 fn is_supported_symbol(symbol: &str) -> bool {
@@ -206,4 +444,24 @@ fn symbol_to_bytes(symbol: &str) -> Result<[u8; SYMBOL_BYTES]> {
     let mut bytes = [0_u8; SYMBOL_BYTES];
     bytes[..symbol.len()].copy_from_slice(symbol.as_bytes());
     Ok(bytes)
+}
+
+fn price_to_tile_index(start_price: i64, final_price: i64, tile_width_bps: i64) -> Result<u8> {
+    require!(start_price > 0 && final_price > 0, TickError::InvalidPrice);
+    require!(tile_width_bps > 0, TickError::InvalidTile);
+
+    let delta_bps = final_price
+        .checked_sub(start_price)
+        .ok_or(TickError::MathOverflow)?
+        .checked_mul(10_000)
+        .ok_or(TickError::MathOverflow)?
+        .checked_div(start_price)
+        .ok_or(TickError::MathOverflow)?;
+    let centered_index = delta_bps
+        .checked_div(tile_width_bps)
+        .ok_or(TickError::MathOverflow)?
+        .checked_add(4)
+        .ok_or(TickError::MathOverflow)?;
+
+    Ok(centered_index.clamp(0, (TILE_COUNT - 1) as i64) as u8)
 }

@@ -11,7 +11,11 @@ export function AppProviders({ children }: PropsWithChildren) {
       <NetworkProvider
         networks={AppConfig.networks}
         render={({ selectedNetwork }) => (
-          <MobileWalletProvider cluster={selectedNetwork} identity={AppConfig.identity}>
+          <MobileWalletProvider
+            cluster={selectedNetwork}
+            identity={AppConfig.identity}
+            key={`${selectedNetwork.id}:${selectedNetwork.url}`}
+          >
             {children}
           </MobileWalletProvider>
         )}

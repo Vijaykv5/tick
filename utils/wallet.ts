@@ -36,5 +36,5 @@ export function getWalletAvatar(address: string) {
 }
 
 export function getSolscanAccountUrl(address: string): string {
-  return `https://solscan.io/account/${address}`
+  return `https://solscan.io/account/${address}?cluster=devnet`
 }
