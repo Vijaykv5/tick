@@ -39,6 +39,11 @@ yarn-error.*
 
 app-example
 
+# Anchor
+/target
+/test-ledger
+.anchor/
+
 # generated native folders
 /ios
 /android

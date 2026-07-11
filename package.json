@@ -3,8 +3,9 @@
   "scripts": {
     "android": "expo run:android",
     "android:build": "expo prebuild -p android",
-    "build": "tsc --noEmit && npm run android:build",
-    "ci": "tsc --noEmit && npm run lint:check && npm run format:check && npm run android:build",
+    "anchor:test": "ts-mocha -p ./tsconfig.anchor.json -t 1000000 tests/**/*.ts",
+    "build": "tsc --noEmit && bun run android:build",
+    "ci": "tsc --noEmit && bun run lint:check && bun run format:check && bun run android:build",
     "dev": "expo start --clear --dev-client --reset-cache",
     "doctor": "npx -y expo-doctor@latest",
     "format": "prettier --write .",
@@ -66,10 +67,15 @@
     "react-native-worklets": "0.7.4"
   },
   "devDependencies": {
+    "@coral-xyz/anchor": "^0.32.1",
+    "@types/mocha": "^10.0.10",
+    "@types/node": "^24.10.0",
     "@types/react": "~19.2.14",
     "eslint": "^9.25.0",
     "eslint-config-expo": "~55.0.0",
+    "mocha": "^11.7.5",
     "prettier": "^3.8.1",
+    "ts-mocha": "^11.1.0",
     "typescript": "~5.9.2"
   },
   "private": true
