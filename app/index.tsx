@@ -1,4 +1,4 @@
-import { AccessibilityInfo, Linking, Modal, Pressable, Text, View } from 'react-native'
+import { AccessibilityInfo, Image, ImageSourcePropType, Linking, Modal, Pressable, ScrollView, Text, View } from 'react-native'
 import { SafeAreaView } from 'react-native-safe-area-context'
 import React, { useEffect, useState } from 'react'
 import Animated, {
@@ -22,17 +22,54 @@ import {
   shortenAddress,
 } from '@/utils/wallet'
 
+type Pool = {
+  accent: string
+  id: 'btc' | 'sol' | 'eth'
+  logo: ImageSourcePropType
+  name: string
+  price: string
+  symbol: string
+}
+
+const POOLS: Pool[] = [
+  {
+    accent: '#ff9d17',
+    id: 'btc',
+    logo: require('../assets/images/btc.webp'),
+    name: 'btc daily dash',
+    price: '$64,174.06',
+    symbol: 'BTC',
+  },
+  {
+    accent: '#8d6bff',
+    id: 'sol',
+    logo: require('../assets/images/sol.webp'),
+    name: 'sol daily dash',
+    price: '$142.31',
+    symbol: 'SOL',
+  },
+  {
+    accent: '#79a7ff',
+    id: 'eth',
+    logo: require('../assets/images/eth.webp'),
+    name: 'eth daily dash',
+    price: '$3,312.44',
+    symbol: 'ETH',
+  },
+]
+
 export default function HomeScreen() {
   const { account, connect, disconnect } = useMobileWallet()
   const [showApp, setShowApp] = useState(false)
   const [reduceMotion, setReduceMotion] = useState(false)
   const [isWalletSheetOpen, setWalletSheetOpen] = useState(false)
   const [copyLabel, setCopyLabel] = useState('Copy Address')
-  const ticOpacity = useSharedValue(0)
-  const ticTranslateY = useSharedValue(18)
-  const kOpacity = useSharedValue(0)
-  const kScale = useSharedValue(0.42)
-  const kTranslateX = useSharedValue(-12)
+  const [selectedPool, setSelectedPool] = useState<Pool | null>(null)
+  const tOpacity = useSharedValue(0)
+  const tScale = useSharedValue(0.72)
+  const tTranslateY = useSharedValue(12)
+  const ickOpacity = useSharedValue(0)
+  const ickRevealWidth = useSharedValue(0)
   const contentOpacity = useSharedValue(0)
 
   useEffect(() => {
@@ -41,31 +78,28 @@ export default function HomeScreen() {
 
   useEffect(() => {
     if (reduceMotion) {
-      ticOpacity.value = 1
-      ticTranslateY.value = 0
-      kOpacity.value = 1
-      kScale.value = 1
-      kTranslateX.value = 0
+      tOpacity.value = 1
+      tScale.value = 1
+      tTranslateY.value = 0
+      ickOpacity.value = 1
+      ickRevealWidth.value = 112
       setShowApp(true)
       contentOpacity.value = 1
       return
     }
 
-    ticOpacity.value = withTiming(1, { duration: 250, easing: Easing.out(Easing.cubic) })
-    ticTranslateY.value = withTiming(0, { duration: 250, easing: Easing.out(Easing.cubic) })
-    kOpacity.value = withDelay(280, withTiming(1, { duration: 150, easing: Easing.out(Easing.cubic) }))
-    kTranslateX.value = withDelay(280, withTiming(0, { duration: 220, easing: Easing.out(Easing.cubic) }))
-    kScale.value = withDelay(
-      280,
-      withSequence(
-        withSpring(1.14, { damping: 9, stiffness: 150 }),
-        withSpring(1, { damping: 13, stiffness: 170 }),
-      ),
+    tOpacity.value = withTiming(1, { duration: 120, easing: Easing.out(Easing.cubic) })
+    tTranslateY.value = withTiming(0, { duration: 180, easing: Easing.out(Easing.cubic) })
+    tScale.value = withSequence(
+      withSpring(1.08, { damping: 9, stiffness: 170 }),
+      withSpring(1, { damping: 13, stiffness: 190 }),
     )
-    const showAppTimer = setTimeout(() => setShowApp(true), 1100)
+    ickOpacity.value = withDelay(260, withTiming(1, { duration: 80, easing: Easing.out(Easing.cubic) }))
+    ickRevealWidth.value = withDelay(260, withTiming(112, { duration: 420, easing: Easing.out(Easing.cubic) }))
+    const showAppTimer = setTimeout(() => setShowApp(true), 1250)
 
     return () => clearTimeout(showAppTimer)
-  }, [contentOpacity, kOpacity, kScale, kTranslateX, reduceMotion, ticOpacity, ticTranslateY])
+  }, [contentOpacity, ickOpacity, ickRevealWidth, reduceMotion, tOpacity, tScale, tTranslateY])
 
   useEffect(() => {
     if (!showApp || reduceMotion) {
@@ -75,14 +109,14 @@ export default function HomeScreen() {
     contentOpacity.value = withTiming(1, { duration: 250, easing: Easing.out(Easing.cubic) })
   }, [contentOpacity, reduceMotion, showApp])
 
-  const ticStyle = useAnimatedStyle(() => ({
-    opacity: ticOpacity.value,
-    transform: [{ translateY: ticTranslateY.value }],
+  const tStyle = useAnimatedStyle(() => ({
+    opacity: tOpacity.value,
+    transform: [{ translateY: tTranslateY.value }, { scale: tScale.value }],
   }))
 
-  const kStyle = useAnimatedStyle(() => ({
-    opacity: kOpacity.value,
-    transform: [{ translateX: kTranslateX.value }, { scale: kScale.value }],
+  const ickRevealStyle = useAnimatedStyle(() => ({
+    opacity: ickOpacity.value,
+    width: ickRevealWidth.value,
   }))
 
   const contentStyle = useAnimatedStyle(() => ({
@@ -120,12 +154,14 @@ export default function HomeScreen() {
   return (
     <SafeAreaView style={appStyles.screen}>
       {!showApp ? (
-        <View style={appStyles.splash}>
-          <View style={appStyles.splashWord}>
-            <Animated.View style={[appStyles.splashLogoMark, ticStyle]}>
+          <View style={appStyles.splash}>
+            <View style={appStyles.splashWord}>
+            <Animated.View style={[appStyles.splashLogoMark, tStyle]}>
               <Text style={appStyles.splashLogoMarkText}>t</Text>
             </Animated.View>
-            <Animated.Text style={[appStyles.splashIck, kStyle]}>ick</Animated.Text>
+            <Animated.View style={[appStyles.splashIckReveal, ickRevealStyle]}>
+              <Text style={appStyles.splashIck}>ick</Text>
+            </Animated.View>
           </View>
         </View>
       ) : (
@@ -156,18 +192,62 @@ export default function HomeScreen() {
               </Pressable>
             </View>
 
-            <View style={appStyles.poolHeader}>
-              <View style={appStyles.poolSide}>
-                <Text style={appStyles.poolAsset}>BTC</Text>
-                <Text style={appStyles.poolPrice}>$64,174.06</Text>
+            {selectedPool ? (
+              <View style={appStyles.poolDetail}>
+                <Pressable accessibilityRole="button" onPress={() => setSelectedPool(null)} style={appStyles.backButton}>
+                  <Ionicons color="#ffffff" name="chevron-back" size={17} />
+                  <Text style={appStyles.backButtonText}>POOLS</Text>
+                </Pressable>
+
+                <View style={appStyles.poolHeader}>
+                  <View style={appStyles.poolSide}>
+                    <Text style={appStyles.poolAsset}>{selectedPool.symbol}</Text>
+                    <Text style={[appStyles.poolPrice, { color: selectedPool.accent }]}>{selectedPool.price}</Text>
+                  </View>
+                  <View style={appStyles.poolDivider} />
+                  <View style={[appStyles.poolSide, appStyles.poolSideRight]}>
+                    <Text style={appStyles.poolPredictLabel}>PREDICT</Text>
+                    <Text style={appStyles.poolTimer}>18s</Text>
+                  </View>
+                  <View style={appStyles.poolAccent} />
+                </View>
+
+                <View style={appStyles.poolDetailBody}>
+                  <View style={[appStyles.poolLogoLarge, { borderColor: selectedPool.accent }]}>
+                    <Image source={selectedPool.logo} style={appStyles.poolLogoLargeImage} />
+                  </View>
+                  <Text style={appStyles.poolDetailTitle}>{selectedPool.name}</Text>
+                  <Text style={appStyles.poolDetailMeta}>1 min prediction round</Text>
+                </View>
               </View>
-              <View style={appStyles.poolDivider} />
-              <View style={[appStyles.poolSide, appStyles.poolSideRight]}>
-                <Text style={appStyles.poolPredictLabel}>PREDICT</Text>
-                <Text style={appStyles.poolTimer}>18s</Text>
-              </View>
-              <View style={appStyles.poolAccent} />
-            </View>
+            ) : (
+              <ScrollView contentContainerStyle={appStyles.poolList} showsVerticalScrollIndicator={false}>
+                {POOLS.map((pool) => (
+                  <Pressable
+                    accessibilityRole="button"
+                    key={pool.id}
+                    onPress={() => setSelectedPool(pool)}
+                    style={({ pressed }) => [appStyles.poolCard, pressed && appStyles.poolCardPressed]}
+                  >
+                    <View style={[appStyles.poolLogo, { borderColor: pool.accent }]}>
+                      <Image source={pool.logo} style={appStyles.poolLogoImage} />
+                    </View>
+
+                    <View style={appStyles.poolCardContent}>
+                      <Text style={appStyles.poolCardTitle}>{pool.name}</Text>
+                      <Text style={appStyles.poolCardTime}>1 min</Text>
+                    </View>
+
+                    <View style={appStyles.poolCardFooter}>
+                      <Text style={appStyles.poolCardPrice}>Current price : {pool.price}</Text>
+                      <View style={appStyles.tickItButton}>
+                        <Text style={appStyles.tickItButtonText}>tick it</Text>
+                      </View>
+                    </View>
+                  </Pressable>
+                ))}
+              </ScrollView>
+            )}
           </View>
 
           <Modal
