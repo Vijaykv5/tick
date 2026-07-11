@@ -1,4 +1,14 @@
-import { AccessibilityInfo, Image, ImageSourcePropType, Linking, Modal, Pressable, ScrollView, Text, View } from 'react-native'
+import {
+  AccessibilityInfo,
+  Image,
+  ImageSourcePropType,
+  Linking,
+  Modal,
+  Pressable,
+  ScrollView,
+  Text,
+  View,
+} from 'react-native'
 import { SafeAreaView } from 'react-native-safe-area-context'
 import React, { useEffect, useState } from 'react'
 import Animated, {
@@ -21,6 +31,16 @@ import {
   isWalletConnected,
   shortenAddress,
 } from '@/utils/wallet'
+import { address as solanaAddress, type Instruction } from '@solana/kit'
+import {
+  DEFAULT_ROUND_DURATION_SECONDS,
+  getInitializePoolInstruction,
+  getOpenRoundInstruction,
+  getPlacePredictionInstruction,
+  getTickPredictionAddresses,
+  TICK_PREDICTION_PROGRAM_ID,
+  type PredictionDirection,
+} from '@/features/tick-prediction/tick-prediction-client'
 
 type Pool = {
   accent: string
@@ -59,12 +79,14 @@ const POOLS: Pool[] = [
 ]
 
 export default function HomeScreen() {
-  const { account, connect, disconnect } = useMobileWallet()
+  const { account, client, connect, disconnect, sendTransactions } = useMobileWallet()
   const [showApp, setShowApp] = useState(false)
   const [reduceMotion, setReduceMotion] = useState(false)
   const [isWalletSheetOpen, setWalletSheetOpen] = useState(false)
   const [copyLabel, setCopyLabel] = useState('Copy Address')
   const [selectedPool, setSelectedPool] = useState<Pool | null>(null)
+  const [predictionStatus, setPredictionStatus] = useState('')
+  const [pendingDirection, setPendingDirection] = useState<PredictionDirection | null>(null)
   const tOpacity = useSharedValue(0)
   const tScale = useSharedValue(0.72)
   const tTranslateY = useSharedValue(12)
@@ -109,6 +131,11 @@ export default function HomeScreen() {
     contentOpacity.value = withTiming(1, { duration: 250, easing: Easing.out(Easing.cubic) })
   }, [contentOpacity, reduceMotion, showApp])
 
+  useEffect(() => {
+    setPredictionStatus('')
+    setPendingDirection(null)
+  }, [selectedPool])
+
   const tStyle = useAnimatedStyle(() => ({
     opacity: tOpacity.value,
     transform: [{ translateY: tTranslateY.value }, { scale: tScale.value }],
@@ -151,11 +178,88 @@ export default function HomeScreen() {
     disconnect()
   }
 
+  function getPoolStartPrice(pool: Pool) {
+    return BigInt(Math.max(1, Math.round(Number(pool.price.replace(/[$,]/g, '')) * 100)))
+  }
+
+  async function placePrediction(direction: PredictionDirection) {
+    const activePool = selectedPool
+    if (!activePool || pendingDirection) {
+      return
+    }
+
+    setPendingDirection(direction)
+    setPredictionStatus('')
+
+    try {
+      const walletAccount = account ?? (await connect())
+      const predictorAddress = getWalletAddress(walletAccount)
+
+      if (!predictorAddress) {
+        throw new Error('Wallet connection did not return an address.')
+      }
+
+      const programAccount = await client.rpc
+        .getAccountInfo(solanaAddress(TICK_PREDICTION_PROGRAM_ID), { encoding: 'base64' })
+        .send()
+
+      if (!programAccount.value) {
+        throw new Error('Tick is not deployed on the selected network. Switch to devnet after deploying the program.')
+      }
+
+      const roundId = BigInt(Date.now())
+      const now = BigInt(Math.floor(Date.now() / 1000))
+      const startsAt = now - 5n
+      const endsAt = startsAt + DEFAULT_ROUND_DURATION_SECONDS
+      const addresses = getTickPredictionAddresses(activePool.symbol, predictorAddress, roundId)
+      const poolAccount = await client.rpc.getAccountInfo(solanaAddress(addresses.pool), { encoding: 'base64' }).send()
+      const instructions: Instruction[] = []
+
+      if (!poolAccount.value) {
+        instructions.push(
+          getInitializePoolInstruction({
+            authorityAddress: predictorAddress,
+            symbol: activePool.symbol,
+          }),
+        )
+      }
+
+      instructions.push(
+        getOpenRoundInstruction({
+          authorityAddress: predictorAddress,
+          endsAt,
+          roundId,
+          startPrice: getPoolStartPrice(activePool),
+          startsAt,
+          symbol: activePool.symbol,
+        }),
+      )
+
+      instructions.push(
+        getPlacePredictionInstruction({
+          direction,
+          predictorAddress,
+          roundId,
+          symbol: activePool.symbol,
+        }),
+      )
+
+      const signature = await sendTransactions(instructions)
+
+      setPredictionStatus(`${direction.toUpperCase()} prediction sent: ${shortenAddress(signature, 6)}`)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Could not send prediction.'
+      setPredictionStatus(message)
+    } finally {
+      setPendingDirection(null)
+    }
+  }
+
   return (
     <SafeAreaView style={appStyles.screen}>
       {!showApp ? (
-          <View style={appStyles.splash}>
-            <View style={appStyles.splashWord}>
+        <View style={appStyles.splash}>
+          <View style={appStyles.splashWord}>
             <Animated.View style={[appStyles.splashLogoMark, tStyle]}>
               <Text style={appStyles.splashLogoMarkText}>t</Text>
             </Animated.View>
@@ -194,7 +298,11 @@ export default function HomeScreen() {
 
             {selectedPool ? (
               <View style={appStyles.poolDetail}>
-                <Pressable accessibilityRole="button" onPress={() => setSelectedPool(null)} style={appStyles.backButton}>
+                <Pressable
+                  accessibilityRole="button"
+                  onPress={() => setSelectedPool(null)}
+                  style={appStyles.backButton}
+                >
                   <Ionicons color="#ffffff" name="chevron-back" size={17} />
                   <Text style={appStyles.backButtonText}>POOLS</Text>
                 </Pressable>
@@ -218,6 +326,39 @@ export default function HomeScreen() {
                   </View>
                   <Text style={appStyles.poolDetailTitle}>{selectedPool.name}</Text>
                   <Text style={appStyles.poolDetailMeta}>1 min prediction round</Text>
+                  <View style={appStyles.predictionActions}>
+                    <Pressable
+                      accessibilityRole="button"
+                      disabled={Boolean(pendingDirection)}
+                      onPress={() => placePrediction('up')}
+                      style={({ pressed }) => [
+                        appStyles.predictionButton,
+                        appStyles.predictionButtonUp,
+                        pressed && appStyles.poolCardPressed,
+                        pendingDirection && appStyles.predictionButtonDisabled,
+                      ]}
+                    >
+                      <Ionicons color="#000000" name="trending-up" size={20} />
+                      <Text style={appStyles.predictionButtonText}>{pendingDirection === 'up' ? 'sending' : 'up'}</Text>
+                    </Pressable>
+                    <Pressable
+                      accessibilityRole="button"
+                      disabled={Boolean(pendingDirection)}
+                      onPress={() => placePrediction('down')}
+                      style={({ pressed }) => [
+                        appStyles.predictionButton,
+                        appStyles.predictionButtonDown,
+                        pressed && appStyles.poolCardPressed,
+                        pendingDirection && appStyles.predictionButtonDisabled,
+                      ]}
+                    >
+                      <Ionicons color="#ffffff" name="trending-down" size={20} />
+                      <Text style={[appStyles.predictionButtonText, appStyles.predictionButtonTextLight]}>
+                        {pendingDirection === 'down' ? 'sending' : 'down'}
+                      </Text>
+                    </Pressable>
+                  </View>
+                  {predictionStatus ? <Text style={appStyles.predictionStatus}>{predictionStatus}</Text> : null}
                 </View>
               </View>
             ) : (
@@ -272,7 +413,11 @@ export default function HomeScreen() {
                     <Pressable accessibilityRole="link" onPress={openSolscan} style={appStyles.sheetAction}>
                       <Text style={appStyles.sheetActionText}>View on Solscan</Text>
                     </Pressable>
-                    <Pressable accessibilityRole="button" onPress={disconnectWallet} style={appStyles.sheetActionDanger}>
+                    <Pressable
+                      accessibilityRole="button"
+                      onPress={disconnectWallet}
+                      style={appStyles.sheetActionDanger}
+                    >
                       <Text style={appStyles.sheetActionDangerText}>Disconnect Wallet</Text>
                     </Pressable>
                   </>

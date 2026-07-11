@@ -92,10 +92,7 @@ pub struct InitializePool<'info> {
 #[derive(Accounts)]
 #[instruction(round_id: u64)]
 pub struct OpenRound<'info> {
-    #[account(
-        mut,
-        has_one = authority
-    )]
+    #[account(mut)]
     pub pool: Account<'info, Pool>,
     #[account(
         init,

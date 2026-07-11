@@ -338,6 +338,51 @@ export const appStyles = StyleSheet.create({
     lineHeight: 23,
     textAlign: 'center',
   },
+  predictionActions: {
+    flexDirection: 'row',
+    gap: 10,
+    marginTop: 8,
+    width: '100%',
+  },
+  predictionButton: {
+    alignItems: 'center',
+    borderRadius: 8,
+    flex: 1,
+    flexDirection: 'row',
+    gap: 8,
+    justifyContent: 'center',
+    minHeight: 52,
+    paddingHorizontal: 12,
+  },
+  predictionButtonUp: {
+    backgroundColor: '#b8ff66',
+  },
+  predictionButtonDown: {
+    backgroundColor: '#222222',
+    borderColor: '#474747',
+    borderWidth: 1,
+  },
+  predictionButtonDisabled: {
+    opacity: 0.58,
+  },
+  predictionButtonText: {
+    color: '#000000',
+    fontFamily: 'Ubuntu-Bold',
+    fontSize: 17,
+    lineHeight: 22,
+    textTransform: 'uppercase',
+  },
+  predictionButtonTextLight: {
+    color: '#ffffff',
+  },
+  predictionStatus: {
+    color: '#d8d8d8',
+    fontFamily: 'Ubuntu-Regular',
+    fontSize: 13,
+    lineHeight: 19,
+    paddingHorizontal: 6,
+    textAlign: 'center',
+  },
   sheetBackdrop: {
     backgroundColor: 'rgba(0, 0, 0, 0.62)',
     flex: 1,
