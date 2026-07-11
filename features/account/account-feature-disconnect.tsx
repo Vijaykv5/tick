@@ -1,9 +1,9 @@
-import { Button } from 'react-native'
 import React from 'react'
 import { useMobileWallet } from '@wallet-ui/react-native-kit'
+import { AppButton } from '@/components/app-button'
 
 export function AccountFeatureDisconnect() {
   const { account, disconnect } = useMobileWallet()
 
-  return <Button disabled={!account} title="Disconnect" onPress={disconnect} />
+  return <AppButton disabled={!account} title="Disconnect" onPress={disconnect} />
 }

@@ -1,6 +1,7 @@
-import { Button, View } from 'react-native'
+import { View } from 'react-native'
 import { appStyles } from '@/constants/app-styles'
 import { Account, useMobileWallet } from '@wallet-ui/react-native-kit'
+import { AppButton } from '@/components/app-button'
 
 export function AccountFeatureSignIn({ account }: { account?: Account }) {
   const { chain, identity, signIn } = useMobileWallet()
@@ -18,7 +19,7 @@ export function AccountFeatureSignIn({ account }: { account?: Account }) {
   }
   return (
     <View style={appStyles.stack}>
-      <Button onPress={submit} title={`Sign In ${account ? `with ${account.label}` : 'and connect'}`} />
+      <AppButton onPress={submit} title={`Sign In ${account ? `with ${account.label}` : 'and connect'}`} />
     </View>
   )
 }

@@ -13,7 +13,7 @@ export function NetworkFeatureIndex() {
       <Text style={appStyles.title}>Network</Text>
       <NetworkUiSelect networks={networks} selectedNetwork={selectedNetwork} setSelectedNetwork={setSelectedNetwork} />
       <View style={appStyles.card}>
-        <Text>Connected to {selectedNetwork.label}</Text>
+        <Text style={appStyles.text}>Connected to {selectedNetwork.label}</Text>
         <NetworkFeatureGetVersion />
         <NetworkFeatureGetGenesisHash />
       </View>

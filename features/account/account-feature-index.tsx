@@ -18,7 +18,7 @@ export function AccountFeatureIndex() {
       {account ? (
         <View style={appStyles.stack}>
           <View style={appStyles.card}>
-            <Text>Connected to {account.label}</Text>
+            <Text style={appStyles.text}>Connected to {account.label}</Text>
             <AccountFeatureGetBalance address={account.address} />
           </View>
           <AccountFeatureSignIn account={account} />

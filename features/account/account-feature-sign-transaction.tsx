@@ -1,8 +1,9 @@
-import { Button, View } from 'react-native'
+import { View } from 'react-native'
 import { appStyles } from '@/constants/app-styles'
 import { getAddMemoInstruction } from '@solana-program/memo'
 import { useMobileWallet } from '@wallet-ui/react-native-kit'
 import { Address, Instruction } from '@solana/kit'
+import { AppButton } from '@/components/app-button'
 
 export function AccountFeatureSignTransaction({ address }: { address: Address }) {
   const { sendTransactions } = useMobileWallet()
@@ -24,7 +25,7 @@ export function AccountFeatureSignTransaction({ address }: { address: Address })
   }
   return (
     <View style={appStyles.stack}>
-      <Button onPress={submit} title="Sign transaction" />
+      <AppButton onPress={submit} title="Sign transaction" />
     </View>
   )
 }

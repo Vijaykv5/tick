@@ -1,7 +1,8 @@
-import { Button, View } from 'react-native'
+import { View } from 'react-native'
 import React from 'react'
 import { SolanaCluster } from '@wallet-ui/react-native-kit'
 import { appStyles } from '@/constants/app-styles'
+import { AppButton } from '@/components/app-button'
 
 export function NetworkUiSelect({
   networks,
@@ -18,7 +19,7 @@ export function NetworkUiSelect({
         .filter((i) => i.id !== selectedNetwork.id)
         .map((network) => (
           <View key={network.id}>
-            <Button
+            <AppButton
               disabled={selectedNetwork.id === network.id}
               onPress={() => setSelectedNetwork(network)}
               title={`Connect to ${network.label}`}

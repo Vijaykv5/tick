@@ -1,8 +1,9 @@
 import { useState } from 'react'
-import { Button, View } from 'react-native'
+import { View } from 'react-native'
 import { appStyles } from '@/constants/app-styles'
 import { useMobileWallet } from '@wallet-ui/react-native-kit'
 import { Address } from '@solana/kit'
+import { AppButton } from '@/components/app-button'
 
 export function AccountFeatureSignMessage({ address }: { address: Address }) {
   const { signMessages } = useMobileWallet()
@@ -19,7 +20,7 @@ export function AccountFeatureSignMessage({ address }: { address: Address }) {
   }
   return (
     <View style={appStyles.stack}>
-      <Button onPress={submit} title={title} />
+      <AppButton onPress={submit} title={title} />
     </View>
   )
 }
