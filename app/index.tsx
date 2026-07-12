@@ -28,7 +28,7 @@ import Clipboard from '@react-native-clipboard/clipboard'
 import { Ionicons } from '@expo/vector-icons'
 import { getWalletAddress, getWalletAvatar, isWalletConnected, shortenAddress } from '@/utils/wallet'
 import { address as solanaAddress, type Instruction } from '@solana/kit'
-import { Connection, Keypair, Transaction } from '@solana/web3.js'
+import { Connection, Keypair, PublicKey, SystemProgram, Transaction } from '@solana/web3.js'
 import {
   getClaimPayoutInstruction,
   getCreateUserUsdcAccountInstruction,
@@ -151,6 +151,7 @@ type ChartSegment = {
   width: number
 }
 
+const BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
 const CHART_HEIGHT = 260
 const CHART_PADDING = 22
 const CHART_AXIS_WIDTH = 70
@@ -161,9 +162,10 @@ const FALLBACK_POINT_STEP_MS = 1_000
 const TILE_SIZE = 24
 const TILE_BUTTON_GAP = 2
 const RESULT_FEEDBACK_MS = 2000
-const MAGICBLOCK_SESSION_FEE_LAMPORTS = 200_000_000
+const MAGICBLOCK_SESSION_SPONSOR_LAMPORTS = 100_000_000
 const MAGICBLOCK_MIN_SESSION_LAMPORTS = 20_000_000
 const MAGICBLOCK_SESSION_PREDICTION_CREDITS = 5n
+const CHART_SMOOTHING_STEPS = 6
 const WIN_VIBRATION_PATTERN = [0, 420, 220, 420, 220, 420, 300]
 const LOSE_VIBRATION_PATTERN = [0, 180, 120, 180, 120, 180, 1220]
 const PRICE_AXIS_RANGE_BY_POOL: Record<Pool['id'], number> = {
@@ -171,6 +173,7 @@ const PRICE_AXIS_RANGE_BY_POOL: Record<Pool['id'], number> = {
   eth: 2,
   sol: 0.2,
 }
+const CHART_RANGE_PADDING_RATIO = 0.08
 
 function formatPoolPrice(value: number) {
   return `$${value.toLocaleString('en-US', {
@@ -294,12 +297,76 @@ function getChartPathPoints(
     .sort((pointA, pointB) => pointA.x - pointB.x)
 }
 
+function getChartDisplayPoints(points: BinanceChartPoint[], currentPrice: number, timestamp: number) {
+  if (!Number.isFinite(currentPrice) || currentPrice <= 0) {
+    return points
+  }
+
+  return appendPricePoint(points, { price: currentPrice, timestamp })
+}
+
 function clamp(value: number, min: number, max: number) {
   return Math.max(min, Math.min(value, max))
 }
 
 function roundPathValue(value: number) {
   return Number(value.toFixed(2))
+}
+
+function getCatmullRomPoint(
+  pointA: ChartPathPoint,
+  pointB: ChartPathPoint,
+  pointC: ChartPathPoint,
+  pointD: ChartPathPoint,
+  progress: number,
+) {
+  const progressSquared = progress * progress
+  const progressCubed = progressSquared * progress
+
+  return {
+    x:
+      0.5 *
+      (2 * pointB.x +
+        (-pointA.x + pointC.x) * progress +
+        (2 * pointA.x - 5 * pointB.x + 4 * pointC.x - pointD.x) * progressSquared +
+        (-pointA.x + 3 * pointB.x - 3 * pointC.x + pointD.x) * progressCubed),
+    y:
+      0.5 *
+      (2 * pointB.y +
+        (-pointA.y + pointC.y) * progress +
+        (2 * pointA.y - 5 * pointB.y + 4 * pointC.y - pointD.y) * progressSquared +
+        (-pointA.y + 3 * pointB.y - 3 * pointC.y + pointD.y) * progressCubed),
+  }
+}
+
+function getSmoothedChartPathPoints(points: ChartPathPoint[]) {
+  if (points.length < 3) {
+    return points
+  }
+
+  const smoothedPoints: ChartPathPoint[] = []
+
+  for (let index = 0; index < points.length - 1; index += 1) {
+    const pointA = points[Math.max(0, index - 1)]
+    const pointB = points[index]
+    const pointC = points[index + 1]
+    const pointD = points[Math.min(points.length - 1, index + 2)]
+
+    smoothedPoints.push(pointB)
+
+    for (let step = 1; step < CHART_SMOOTHING_STEPS; step += 1) {
+      const progress = step / CHART_SMOOTHING_STEPS
+      const point = getCatmullRomPoint(pointA, pointB, pointC, pointD, progress)
+
+      if (Number.isFinite(point.x) && Number.isFinite(point.y)) {
+        smoothedPoints.push(point)
+      }
+    }
+  }
+
+  smoothedPoints.push(points[points.length - 1])
+
+  return smoothedPoints
 }
 
 function getLineSegment(start: ChartPathPoint, end: ChartPathPoint): ChartSegment | null {
@@ -327,9 +394,18 @@ function getChartPriceRange(
   poolId?: Pool['id'],
   centerPrice?: number,
 ) {
+  const prices = values.map((point) => point.price).filter((price) => Number.isFinite(price) && price > 0)
+  const anchorPrice = centerPrice ?? currentPrice
+
   if (poolId) {
-    const visibleRange = getPoolPriceAxisRange(poolId)
-    const center = centerPrice ?? currentPrice
+    const minimumRange = getPoolPriceAxisRange(poolId)
+    const priceFloor = Math.min(...prices, currentPrice, anchorPrice)
+    const priceCeiling = Math.max(...prices, currentPrice, anchorPrice)
+    const padding = minimumRange * CHART_RANGE_PADDING_RATIO
+    const paddedMin = priceFloor - padding
+    const paddedMax = priceCeiling + padding
+    const visibleRange = Math.max(minimumRange, paddedMax - paddedMin)
+    const center = (paddedMin + paddedMax) / 2
 
     return {
       max: center + visibleRange / 2,
@@ -337,13 +413,12 @@ function getChartPriceRange(
     }
   }
 
-  const prices = values.map((point) => point.price)
   const minPrice = prices.length ? Math.min(...prices, currentPrice) : currentPrice
   const maxPrice = prices.length ? Math.max(...prices, currentPrice) : currentPrice
   const minRange = getPoolPriceAxisRange('btc')
   const visibleRange = Math.max(maxPrice - minPrice, minRange)
   const fallbackCenterPrice = (minPrice + maxPrice) / 2
-  const padding = visibleRange * 0.08
+  const padding = visibleRange * CHART_RANGE_PADDING_RATIO
 
   return {
     max: fallbackCenterPrice + visibleRange / 2 + padding,
@@ -362,7 +437,7 @@ function getLiveChartSegments(
   max: number,
   roundStartMs: number,
 ) {
-  const pathPoints = getChartPathPoints(points, width, min, max, roundStartMs)
+  const pathPoints = getSmoothedChartPathPoints(getChartPathPoints(points, width, min, max, roundStartMs))
   const segments: ChartSegment[] = []
 
   for (let index = 0; index < pathPoints.length - 1; index += 1) {
@@ -589,6 +664,81 @@ function getSplMintDecimals(accountInfo: unknown) {
   return mintData[44]
 }
 
+function decodeBase58(value: string) {
+  const bytes = [0]
+
+  for (const character of value) {
+    const alphabetIndex = BASE58_ALPHABET.indexOf(character)
+
+    if (alphabetIndex === -1) {
+      throw new Error('Invalid base58 character.')
+    }
+
+    let carry = alphabetIndex
+
+    for (let index = 0; index < bytes.length; index += 1) {
+      carry += bytes[index] * 58
+      bytes[index] = carry & 0xff
+      carry >>= 8
+    }
+
+    while (carry > 0) {
+      bytes.push(carry & 0xff)
+      carry >>= 8
+    }
+  }
+
+  for (const character of value) {
+    if (character !== '1') {
+      break
+    }
+
+    bytes.push(0)
+  }
+
+  return Uint8Array.from(bytes.reverse())
+}
+
+function keypairFromHouseWalletSecretBytes(secretBytes: Uint8Array) {
+  if (secretBytes.length === 64) {
+    return Keypair.fromSecretKey(secretBytes)
+  }
+
+  if (secretBytes.length === 32) {
+    return Keypair.fromSeed(secretBytes)
+  }
+
+  throw new Error('House wallet private key must decode to 64 bytes, or 32 bytes for a seed.')
+}
+
+function getDevnetHouseWalletKeypair() {
+  const secretKey = AppConfig.magicBlock.sessionSponsorSecretKey.trim().replace(/^['"]|['"]$/g, '')
+
+  if (!secretKey) {
+    return null
+  }
+
+  try {
+    if (secretKey.startsWith('[')) {
+      return keypairFromHouseWalletSecretBytes(Uint8Array.from(JSON.parse(secretKey) as number[]))
+    }
+
+    const base64SecretKey = Uint8Array.from(Buffer.from(secretKey, 'base64'))
+
+    if (base64SecretKey.length === 64 || base64SecretKey.length === 32) {
+      return keypairFromHouseWalletSecretBytes(base64SecretKey)
+    }
+
+    return keypairFromHouseWalletSecretBytes(decodeBase58(secretKey))
+  } catch (error) {
+    throw new Error(
+      `EXPO_PUBLIC_DEVNET_HOUSE_WALLET_SECRET_KEY is invalid. Use a Solana JSON keypair array, base64 secret key, or base58 private key. ${
+        error instanceof Error ? error.message : ''
+      }`.trim(),
+    )
+  }
+}
+
 export default function HomeScreen() {
   const { account, client, connect, disconnect, sendTransactions } = useMobileWallet()
   const { width: screenWidth } = useWindowDimensions()
@@ -616,6 +766,9 @@ export default function HomeScreen() {
   const ickOpacity = useSharedValue(0)
   const ickRevealWidth = useSharedValue(0)
   const contentOpacity = useSharedValue(0)
+  const chartLiveX = useSharedValue(0)
+  const chartLiveY = useSharedValue(0)
+  const chartPulse = useSharedValue(1)
 
   useEffect(() => {
     AccessibilityInfo.isReduceMotionEnabled().then(setReduceMotion)
@@ -789,13 +942,16 @@ export default function HomeScreen() {
       ? selectedPoolMarketData.chartPoints
       : getFallbackChartPoints([selectedPool.currentPrice], roundStartMs)
     : []
+  const selectedPoolDisplayChartPoints = selectedPool
+    ? getChartDisplayPoints(selectedPoolChartPoints, selectedPoolPrice, nowMs)
+    : []
   const activePrediction = selectedPool ? poolPredictions[selectedPool.id] : undefined
   const preparedPrediction = selectedPool ? preparedPredictions[selectedPool.id] : undefined
   const magicBlockPredictionReady =
     AppConfig.magicBlock.enabled && Boolean(preparedPrediction && preparedPrediction.expiresAtMs > nowMs)
-  const currentRoundStartPrice = selectedPoolChartPoints[0]?.price ?? selectedPoolPrice
+  const currentRoundStartPrice = selectedPoolDisplayChartPoints[0]?.price ?? selectedPoolPrice
   const roundStartPrice = activePrediction?.roundStartPrice ?? currentRoundStartPrice
-  const chartRangeValues = getChartRangeValues(selectedPoolChartPoints)
+  const chartRangeValues = getChartRangeValues(selectedPoolDisplayChartPoints)
   const { max: chartMax, min: chartMin } = getChartPriceRange(
     chartRangeValues,
     selectedPoolPrice,
@@ -803,8 +959,14 @@ export default function HomeScreen() {
     roundStartPrice,
   )
   const currentLineY = selectedPool ? getChartY(selectedPoolPrice, chartMin, chartMax) : 0
-  const chartSegments = getLiveChartSegments(selectedPoolChartPoints, chartPlotWidth, chartMin, chartMax, roundStartMs)
-  const latestChartPoint = selectedPoolChartPoints[selectedPoolChartPoints.length - 1]
+  const chartSegments = getLiveChartSegments(
+    selectedPoolDisplayChartPoints,
+    chartPlotWidth,
+    chartMin,
+    chartMax,
+    roundStartMs,
+  )
+  const latestChartPoint = selectedPoolDisplayChartPoints[selectedPoolDisplayChartPoints.length - 1]
   const latestChartX = latestChartPoint ? getChartX(latestChartPoint.timestamp, roundStartMs, chartPlotWidth) : 0
   const latestChartY = latestChartPoint ? getChartY(latestChartPoint.price, chartMin, chartMax) : currentLineY
   const axisPrices = getAxisPrices(chartMin, chartMax)
@@ -829,6 +991,46 @@ export default function HomeScreen() {
     activePrediction && selectedPool
       ? getTilePriceRange(activePrediction.roundStartPrice, activePrediction.tileIndex, selectedPool.id)
       : null
+
+  useEffect(() => {
+    if (!selectedPool) {
+      return
+    }
+
+    if (reduceMotion) {
+      chartLiveX.value = latestChartX
+      chartLiveY.value = latestChartY
+      chartPulse.value = 1
+      return
+    }
+
+    chartLiveX.value = withTiming(latestChartX, { duration: 400, easing: Easing.inOut(Easing.cubic) })
+    chartLiveY.value = withTiming(latestChartY, { duration: 400, easing: Easing.inOut(Easing.cubic) })
+    chartPulse.value = withSequence(
+      withTiming(1.16, { duration: 150, easing: Easing.out(Easing.cubic) }),
+      withSpring(1, { damping: 14, stiffness: 180 }),
+    )
+  }, [chartLiveX, chartLiveY, chartPulse, latestChartX, latestChartY, reduceMotion, selectedPool, selectedPoolPrice])
+
+  const chartGuideStyle = useAnimatedStyle(() => ({
+    top: chartLiveY.value,
+  }))
+
+  const chartCurrentDotHaloStyle = useAnimatedStyle(() => ({
+    left: chartLiveX.value - 18,
+    top: chartLiveY.value - 18,
+    transform: [{ scale: chartPulse.value }],
+  }))
+
+  const chartCurrentDotStyle = useAnimatedStyle(() => ({
+    left: chartLiveX.value - 11,
+    top: chartLiveY.value - 11,
+    transform: [{ scale: chartPulse.value }],
+  }))
+
+  const chartPriceTagStyle = useAnimatedStyle(() => ({
+    top: chartLiveY.value - 17,
+  }))
 
   useEffect(() => {
     if (!isWalletSheetOpen || !connected || !address) {
@@ -986,17 +1188,68 @@ export default function HomeScreen() {
     return sendSessionInstructions([instruction], sessionKeypair, AppConfig.magicBlock.routerRpcUrl || AppConfig.solanaDevnetRpcUrl)
   }
 
-  async function fundSessionSolOnDevnet(sessionKeypair: Keypair) {
+  async function confirmDevnetTransaction(signature: string) {
     const connection = new Connection(AppConfig.solanaDevnetRpcUrl, 'confirmed')
-    const balance = await connection.getBalance(sessionKeypair.publicKey)
+    await connection.confirmTransaction(signature, 'confirmed')
+  }
 
-    if (balance >= MAGICBLOCK_MIN_SESSION_LAMPORTS) {
+  async function topUpSessionSolFromHouseWallet(sessionAuthorityAddress: string) {
+    const houseWallet = getDevnetHouseWalletKeypair()
+
+    if (!houseWallet) {
+      throw new Error('Set EXPO_PUBLIC_DEVNET_HOUSE_WALLET_SECRET_KEY so the house wallet can sponsor MagicBlock session fees.')
+    }
+
+    const connection = new Connection(AppConfig.solanaDevnetRpcUrl, 'confirmed')
+    const houseBalance = await connection.getBalance(houseWallet.publicKey)
+
+    if (houseBalance < MAGICBLOCK_SESSION_SPONSOR_LAMPORTS) {
+      throw new Error(
+        `Devnet house wallet ${shortenAddress(
+          houseWallet.publicKey.toBase58(),
+          6,
+        )} needs at least ${lamportsToSol(
+          BigInt(MAGICBLOCK_SESSION_SPONSOR_LAMPORTS),
+        )} devnet SOL to sponsor MagicBlock fees.`,
+      )
+    }
+
+    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash()
+    const transaction = new Transaction({
+      feePayer: houseWallet.publicKey,
+      recentBlockhash: blockhash,
+    }).add(
+      SystemProgram.transfer({
+        fromPubkey: houseWallet.publicKey,
+        lamports: MAGICBLOCK_SESSION_SPONSOR_LAMPORTS,
+        toPubkey: new PublicKey(sessionAuthorityAddress),
+      }),
+    )
+
+    transaction.sign(houseWallet)
+    const signature = await connection.sendRawTransaction(transaction.serialize(), {
+      skipPreflight: false,
+    })
+
+    await connection.confirmTransaction({ blockhash, lastValidBlockHeight, signature }, 'confirmed')
+  }
+
+  async function ensureMagicBlockSessionSol(sessionKeypair: Keypair) {
+    const sessionAuthorityAddress = sessionKeypair.publicKey.toBase58()
+    const sessionSolBalance = await client.rpc.getBalance(solanaAddress(sessionAuthorityAddress)).send()
+
+    if (sessionSolBalance.value >= BigInt(MAGICBLOCK_MIN_SESSION_LAMPORTS)) {
       return
     }
 
-    const signature = await connection.requestAirdrop(sessionKeypair.publicKey, MAGICBLOCK_SESSION_FEE_LAMPORTS)
-    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash()
-    await connection.confirmTransaction({ blockhash, lastValidBlockHeight, signature }, 'confirmed')
+    setPredictionStatus('MagicBlock session fee balance is low. Refilling from house wallet...')
+    await topUpSessionSolFromHouseWallet(sessionAuthorityAddress)
+
+    const updatedSessionSolBalance = await client.rpc.getBalance(solanaAddress(sessionAuthorityAddress)).send()
+
+    if (updatedSessionSolBalance.value < BigInt(MAGICBLOCK_MIN_SESSION_LAMPORTS)) {
+      throw new Error('MagicBlock session SOL refill is still confirming. Try the tile again in a few seconds.')
+    }
   }
 
   async function prepareMagicBlockPrediction() {
@@ -1039,15 +1292,8 @@ export default function HomeScreen() {
       const sessionKeypair = Keypair.generate()
       const sessionAuthorityAddress = sessionKeypair.publicKey.toBase58()
       const sessionExpiresAtMs = Date.now() + AppConfig.magicBlock.sessionTtlSeconds * 1000
-      try {
-        await fundSessionSolOnDevnet(sessionKeypair)
-      } catch (error) {
-        throw new Error(
-          `Could not fund the MagicBlock session with devnet SOL. Try again in a moment. ${
-            error instanceof Error ? error.message : ''
-          }`.trim(),
-        )
-      }
+      setPredictionStatus('Funding MagicBlock session fees from house wallet...')
+      await topUpSessionSolFromHouseWallet(sessionAuthorityAddress)
 
       const addresses = getTickPredictionAddresses(activePool.symbol, predictorAddress, BigInt(roundStartMs), usdcMintAddress)
       const sessionUsdcAccountAddress = getUserTokenAccountAddress(sessionAuthorityAddress, usdcMintAddress)
@@ -1133,6 +1379,7 @@ export default function HomeScreen() {
       )
 
       const signature = await sendTransactions(instructions)
+      await confirmDevnetTransaction(signature)
 
       setPreparedPredictions((predictions) => ({
         ...predictions,
@@ -1180,15 +1427,7 @@ export default function HomeScreen() {
       const usdcMintAddress = getConfiguredUsdcMint()
       const predictorAddress = prepared.authorityAddress
       const sessionAuthorityAddress = prepared.sessionKeypair.publicKey.toBase58()
-      const sessionSolBalance = await client.rpc.getBalance(solanaAddress(sessionAuthorityAddress)).send()
-
-      if (sessionSolBalance.value < BigInt(MAGICBLOCK_MIN_SESSION_LAMPORTS)) {
-        setPreparedPredictions((predictions) => ({
-          ...predictions,
-          [activePool.id]: undefined,
-        }))
-        throw new Error('MagicBlock session balance is low. Press Predict once to refresh the session.')
-      }
+      await ensureMagicBlockSessionSol(prepared.sessionKeypair)
 
       const activeMarketData = poolMarketData[activePool.id]
       const activePrice = activeMarketData?.price ?? activePool.currentPrice
@@ -1749,7 +1988,9 @@ export default function HomeScreen() {
                         ]}
                       />
                     ))}
-                    <View style={[appStyles.priceChartGuideLine, { top: currentLineY, width: chartPlotWidth }]} />
+                    <Animated.View
+                      style={[appStyles.priceChartGuideLine, { width: chartPlotWidth }, chartGuideStyle]}
+                    />
                     <View style={[appStyles.priceChartAxisRail, { left: chartPlotWidth, width: CHART_AXIS_WIDTH }]} />
                     {axisPrices.map((price, index) => (
                       <Text
@@ -1766,15 +2007,23 @@ export default function HomeScreen() {
                         {formatAxisPrice(price, axisTickSize)}
                       </Text>
                     ))}
-                    <View
+                    <Animated.View
+                      style={[
+                        appStyles.priceChartCurrentDotHalo,
+                        {
+                          backgroundColor: selectedPool.accent,
+                        },
+                        chartCurrentDotHaloStyle,
+                      ]}
+                    />
+                    <Animated.View
                       style={[
                         appStyles.priceChartCurrentDot,
                         {
                           backgroundColor: selectedPool.accent,
                           borderColor: `${selectedPool.accent}42`,
-                          left: latestChartX - 11,
-                          top: latestChartY - 11,
                         },
+                        chartCurrentDotStyle,
                       ]}
                     />
                     {TILE_MULTIPLIERS_BPS.map((multiplierBps, tileIndex) => {
@@ -1826,18 +2075,18 @@ export default function HomeScreen() {
                         </Text>
                       </View>
                     ) : null}
-                    <View
+                    <Animated.View
                       style={[
                         appStyles.priceChartPriceTag,
                         {
                           backgroundColor: selectedPool.accent,
                           right: 6,
-                          top: currentLineY - 17,
                         },
+                        chartPriceTagStyle,
                       ]}
                     >
                       <Text style={appStyles.priceChartPriceTagText}>{formatPoolPrice(selectedPoolPrice)}</Text>
-                    </View>
+                    </Animated.View>
                   </View>
 
                   <View style={appStyles.tileSummary}>
