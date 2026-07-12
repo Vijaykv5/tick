@@ -758,8 +758,9 @@ export const appStyles = StyleSheet.create({
   resultFeedbackOverlay: {
     alignItems: 'center',
     bottom: 0,
-    justifyContent: 'center',
+    justifyContent: 'flex-end',
     left: 0,
+    paddingBottom: 22,
     paddingHorizontal: 20,
     position: 'absolute',
     right: 0,
@@ -767,36 +768,61 @@ export const appStyles = StyleSheet.create({
     zIndex: 50,
   },
   resultFeedbackWin: {
-    backgroundColor: 'rgba(63, 255, 118, 0.24)',
+    backgroundColor: 'rgba(63, 255, 118, 0.22)',
   },
   resultFeedbackLose: {
-    backgroundColor: 'rgba(255, 45, 67, 0.26)',
+    backgroundColor: 'rgba(255, 45, 67, 0.24)',
   },
-  resultFeedbackToast: {
-    alignItems: 'center',
+  resultFeedbackSheet: {
     backgroundColor: '#101413',
-    borderColor: '#303a37',
     borderRadius: 8,
     borderWidth: 1,
-    flexDirection: 'row',
     gap: 12,
-    maxWidth: 360,
-    minHeight: 74,
-    paddingHorizontal: 16,
-    paddingVertical: 13,
+    maxWidth: 390,
+    minHeight: 148,
+    paddingBottom: 18,
+    paddingHorizontal: 18,
+    paddingTop: 10,
+    shadowOpacity: 0.18,
+    shadowRadius: 22,
     width: '100%',
   },
-  resultFeedbackToastWin: {
-    borderColor: 'rgba(184, 255, 102, 0.62)',
+  resultFeedbackSheetWin: {
+    borderColor: 'rgba(184, 255, 102, 0.4)',
     shadowColor: '#72ff5f',
-    shadowOpacity: 0.26,
-    shadowRadius: 18,
   },
-  resultFeedbackToastLose: {
-    borderColor: 'rgba(255, 107, 107, 0.62)',
+  resultFeedbackSheetLose: {
+    borderColor: 'rgba(255, 139, 139, 0.36)',
     shadowColor: '#ff4a4a',
-    shadowOpacity: 0.26,
-    shadowRadius: 18,
+  },
+  resultFeedbackSheetHandle: {
+    alignSelf: 'center',
+    backgroundColor: 'rgba(255, 255, 255, 0.28)',
+    borderRadius: 999,
+    height: 4,
+    marginBottom: 2,
+    width: 44,
+  },
+  resultFeedbackSheetHeader: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    gap: 12,
+  },
+  resultFeedbackIcon: {
+    alignItems: 'center',
+    borderRadius: 999,
+    borderWidth: 1,
+    height: 42,
+    justifyContent: 'center',
+    width: 42,
+  },
+  resultFeedbackIconWin: {
+    backgroundColor: 'rgba(184, 255, 102, 0.13)',
+    borderColor: 'rgba(184, 255, 102, 0.42)',
+  },
+  resultFeedbackIconLose: {
+    backgroundColor: 'rgba(255, 107, 107, 0.14)',
+    borderColor: 'rgba(255, 139, 139, 0.4)',
   },
   resultFeedbackCopy: {
     flex: 1,
@@ -813,6 +839,12 @@ export const appStyles = StyleSheet.create({
     fontFamily: 'Ubuntu-Regular',
     fontSize: 13,
     lineHeight: 18,
+  },
+  resultFeedbackDate: {
+    color: '#7f8b87',
+    fontFamily: 'Ubuntu-Regular',
+    fontSize: 12,
+    lineHeight: 17,
   },
   sheetBackdrop: {
     backgroundColor: 'rgba(0, 0, 0, 0.62)',

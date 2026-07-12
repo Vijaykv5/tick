@@ -129,6 +129,7 @@ type PreparedPrediction = {
 
 type ResultFeedback = {
   message: string
+  settledAtMs: number
   title: string
   type: 'win' | 'lose'
 }
@@ -162,6 +163,7 @@ const FALLBACK_POINT_STEP_MS = 1_000
 const TILE_SIZE = 24
 const TILE_BUTTON_GAP = 2
 const RESULT_FEEDBACK_MS = 2000
+const RESULT_SHEET_FEEDBACK_MS = 4200
 const MAGICBLOCK_SESSION_SPONSOR_LAMPORTS = 100_000_000
 const MAGICBLOCK_MIN_SESSION_LAMPORTS = 20_000_000
 const MAGICBLOCK_SESSION_PREDICTION_CREDITS = 5n
@@ -195,6 +197,17 @@ function formatAxisPrice(value: number, tickSize: number) {
 function formatUtcMinute(ms: number) {
   const date = new Date(ms)
   return `${date.getUTCHours().toString().padStart(2, '0')}:${date.getUTCMinutes().toString().padStart(2, '0')} UTC`
+}
+
+function formatResultDate(ms: number) {
+  return new Intl.DateTimeFormat('en-US', {
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+    month: 'short',
+    timeZoneName: 'short',
+    year: 'numeric',
+  }).format(new Date(ms))
 }
 
 function formatRoundTimer(ms: number) {
@@ -769,6 +782,8 @@ export default function HomeScreen() {
   const chartLiveX = useSharedValue(0)
   const chartLiveY = useSharedValue(0)
   const chartPulse = useSharedValue(1)
+  const resultSheetOpacity = useSharedValue(0)
+  const resultSheetTranslateY = useSharedValue(36)
 
   useEffect(() => {
     AccessibilityInfo.isReduceMotionEnabled().then(setReduceMotion)
@@ -823,16 +838,28 @@ export default function HomeScreen() {
       return
     }
 
+    if (reduceMotion) {
+      resultSheetOpacity.value = 1
+      resultSheetTranslateY.value = 0
+    } else {
+      resultSheetOpacity.value = 0
+      resultSheetTranslateY.value = 36
+      resultSheetOpacity.value = withTiming(1, { duration: 200, easing: Easing.out(Easing.cubic) })
+      resultSheetTranslateY.value = withSpring(0, { damping: 18, stiffness: 190 })
+    }
+
     const feedbackTimer = setTimeout(() => {
       setResultFeedback(null)
       Vibration.cancel()
-    }, RESULT_FEEDBACK_MS)
+      resultSheetOpacity.value = 0
+      resultSheetTranslateY.value = 36
+    }, RESULT_SHEET_FEEDBACK_MS)
 
     return () => {
       clearTimeout(feedbackTimer)
       Vibration.cancel()
     }
-  }, [resultFeedback])
+  }, [reduceMotion, resultFeedback, resultSheetOpacity, resultSheetTranslateY])
 
   const roundStartMs = Math.floor(nowMs / ROUND_DURATION_MS) * ROUND_DURATION_MS
   const roundEndMs = roundStartMs + ROUND_DURATION_MS
@@ -928,6 +955,11 @@ export default function HomeScreen() {
 
   const contentStyle = useAnimatedStyle(() => ({
     opacity: contentOpacity.value,
+  }))
+
+  const resultSheetStyle = useAnimatedStyle(() => ({
+    opacity: resultSheetOpacity.value,
+    transform: [{ translateY: resultSheetTranslateY.value }],
   }))
 
   const address = getWalletAddress(account)
@@ -1089,12 +1121,14 @@ export default function HomeScreen() {
     const settledPredictionWon = activePrediction.tileIndex === settledWinningTileIndex
     const feedback: ResultFeedback = settledPredictionWon
       ? {
-          message: `You won ${formatUsdcAmount(activePredictionPayout)}. Sending the payout to your USDC account.`,
+          message: `Nice call. You won ${formatUsdcAmount(activePredictionPayout)}, and the payout is being sent to your USDC account.`,
+          settledAtMs: Date.now(),
           title: 'Your tick won',
           type: 'win',
         }
       : {
-          message: 'Your tile missed this round. Pick the next move.',
+          message: 'Your tile landed outside the final price range. No payout this round, but the next window is already moving.',
+          settledAtMs: Date.now(),
           title: 'You lost',
           type: 'lose',
         }
@@ -1137,7 +1171,7 @@ export default function HomeScreen() {
     const resetTimer = setTimeout(() => {
       clearPoolPrediction(setPoolPredictions, selectedPool.id, activePrediction.roundId)
       setPredictionStatus('')
-    }, RESULT_FEEDBACK_MS + 450)
+    }, RESULT_SHEET_FEEDBACK_MS + 450)
 
     return () => clearTimeout(resetTimer)
   }, [activePrediction?.feedbackShown, activePrediction?.roundId, activePredictionWon, roundSettled, selectedPool])
@@ -2224,22 +2258,34 @@ export default function HomeScreen() {
                 resultFeedback.type === 'win' ? appStyles.resultFeedbackWin : appStyles.resultFeedbackLose,
               ]}
             >
-              <View
+              <Animated.View
                 style={[
-                  appStyles.resultFeedbackToast,
-                  resultFeedback.type === 'win' ? appStyles.resultFeedbackToastWin : appStyles.resultFeedbackToastLose,
+                  appStyles.resultFeedbackSheet,
+                  resultFeedback.type === 'win' ? appStyles.resultFeedbackSheetWin : appStyles.resultFeedbackSheetLose,
+                  resultSheetStyle,
                 ]}
               >
-                <Ionicons
-                  color={resultFeedback.type === 'win' ? '#b8ff66' : '#ff6b6b'}
-                  name={resultFeedback.type === 'win' ? 'checkmark-circle' : 'close-circle'}
-                  size={28}
-                />
-                <View style={appStyles.resultFeedbackCopy}>
-                  <Text style={appStyles.resultFeedbackTitle}>{resultFeedback.title}</Text>
-                  <Text style={appStyles.resultFeedbackMessage}>{resultFeedback.message}</Text>
+                <View style={appStyles.resultFeedbackSheetHandle} />
+                <View style={appStyles.resultFeedbackSheetHeader}>
+                  <View
+                    style={[
+                      appStyles.resultFeedbackIcon,
+                      resultFeedback.type === 'win' ? appStyles.resultFeedbackIconWin : appStyles.resultFeedbackIconLose,
+                    ]}
+                  >
+                    <Ionicons
+                      color={resultFeedback.type === 'win' ? '#b8ff66' : '#ff8b8b'}
+                      name={resultFeedback.type === 'win' ? 'checkmark' : 'close'}
+                      size={20}
+                    />
+                  </View>
+                  <View style={appStyles.resultFeedbackCopy}>
+                    <Text style={appStyles.resultFeedbackTitle}>{resultFeedback.title}</Text>
+                    <Text style={appStyles.resultFeedbackDate}>{formatResultDate(resultFeedback.settledAtMs)}</Text>
+                  </View>
                 </View>
-              </View>
+                <Text style={appStyles.resultFeedbackMessage}>{resultFeedback.message}</Text>
+              </Animated.View>
             </View>
           ) : null}
 
