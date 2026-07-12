@@ -1,6 +1,9 @@
-type MaybeWalletAccount = {
-  address?: unknown
-} | null | undefined
+type MaybeWalletAccount =
+  | {
+      address?: unknown
+    }
+  | null
+  | undefined
 
 export function isWalletConnected(account: MaybeWalletAccount): boolean {
   return Boolean(account?.address)

@@ -5,7 +5,7 @@ function requireDevnetUrl(url: string, label: string) {
   const mainnetSignals = ['mainnet', 'mainnet-beta', 'api.mainnet', 'solana-mainnet']
 
   if (mainnetSignals.some((signal) => normalizedUrl.includes(signal))) {
-    throw new Error(`${label} must stay on devnet. Refusing non-devnet URL: ${url}`)
+    throw new Error(`${label} is not configured for this build.`)
   }
 
   return url
@@ -17,7 +17,7 @@ function requireMagicBlockDevnetUrl(url: string, label: string) {
   }
 
   if (!url.toLowerCase().includes('devnet')) {
-    throw new Error(`${label} must stay on MagicBlock devnet. Refusing URL: ${url}`)
+    throw new Error(`${label} is not configured for this build.`)
   }
 
   return url
@@ -27,15 +27,12 @@ export class AppConfig {
   static identity: AppIdentity = { name: 'kit-expo' }
   static devnetUsdcMint = process.env.EXPO_PUBLIC_DEVNET_USDC_MINT ?? ''
   static solanaDevnetRpcUrl = requireDevnetUrl(
-    process.env.EXPO_PUBLIC_SOLANA_DEVNET_RPC_URL ??
-      'https://api.devnet.solana.com',
+    process.env.EXPO_PUBLIC_SOLANA_DEVNET_RPC_URL ?? 'https://api.devnet.solana.com',
     'EXPO_PUBLIC_SOLANA_DEVNET_RPC_URL',
   )
   static magicBlock = {
     enabled: process.env.EXPO_PUBLIC_MAGICBLOCK_ENABLED === 'true',
-    erValidator:
-      process.env.EXPO_PUBLIC_MAGICBLOCK_ER_VALIDATOR ??
-      'MAS1Dt9qreoRMQ14YQuhg8UTZMMzDdKhmkZMECCzk57',
+    erValidator: process.env.EXPO_PUBLIC_MAGICBLOCK_ER_VALIDATOR ?? 'MAS1Dt9qreoRMQ14YQuhg8UTZMMzDdKhmkZMECCzk57',
     routerRpcUrl: requireMagicBlockDevnetUrl(
       process.env.EXPO_PUBLIC_MAGICBLOCK_ROUTER_RPC_URL ?? '',
       'EXPO_PUBLIC_MAGICBLOCK_ROUTER_RPC_URL',
@@ -47,7 +44,5 @@ export class AppConfig {
     sessionSponsorSecretKey: process.env.EXPO_PUBLIC_DEVNET_HOUSE_WALLET_SECRET_KEY ?? '',
     sessionTtlSeconds: Number(process.env.EXPO_PUBLIC_MAGICBLOCK_SESSION_TTL_SECONDS ?? 900),
   }
-  static networks: SolanaCluster[] = [
-    createSolanaDevnet({ url: AppConfig.solanaDevnetRpcUrl }),
-  ]
+  static networks: SolanaCluster[] = [createSolanaDevnet({ url: AppConfig.solanaDevnetRpcUrl })]
 }

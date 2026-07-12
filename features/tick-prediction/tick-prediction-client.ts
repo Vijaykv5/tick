@@ -94,10 +94,7 @@ function poolSessionPda(pool: PublicKey, authority: PublicKey, sessionAuthority:
 }
 
 function delegateBufferPda(delegatedAccount: PublicKey) {
-  return PublicKey.findProgramAddressSync(
-    [Buffer.from('buffer'), delegatedAccount.toBuffer()],
-    programPublicKey,
-  )[0]
+  return PublicKey.findProgramAddressSync([Buffer.from('buffer'), delegatedAccount.toBuffer()], programPublicKey)[0]
 }
 
 function delegationRecordPda(delegatedAccount: PublicKey) {
@@ -139,10 +136,8 @@ export function kitInstructionToWeb3Instruction(instruction: Instruction): Trans
     keys:
       instruction.accounts?.map((account) => ({
         pubkey: new PublicKey(account.address),
-        isSigner:
-          account.role === AccountRole.READONLY_SIGNER || account.role === AccountRole.WRITABLE_SIGNER,
-        isWritable:
-          account.role === AccountRole.WRITABLE || account.role === AccountRole.WRITABLE_SIGNER,
+        isSigner: account.role === AccountRole.READONLY_SIGNER || account.role === AccountRole.WRITABLE_SIGNER,
+        isWritable: account.role === AccountRole.WRITABLE || account.role === AccountRole.WRITABLE_SIGNER,
       })) ?? [],
     data: Buffer.from(instruction.data ?? []),
   })

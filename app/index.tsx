@@ -164,6 +164,7 @@ const TILE_SIZE = 24
 const TILE_BUTTON_GAP = 2
 const RESULT_FEEDBACK_MS = 2000
 const RESULT_SHEET_FEEDBACK_MS = 4200
+const CHART_AXIS_TARGET_TICKS = 6
 const MAGICBLOCK_SESSION_SPONSOR_LAMPORTS = 100_000_000
 const MAGICBLOCK_MIN_SESSION_LAMPORTS = 20_000_000
 const MAGICBLOCK_SESSION_PREDICTION_CREDITS = 5n
@@ -401,6 +402,37 @@ function getPoolPriceAxisRange(poolId: Pool['id']) {
   return PRICE_AXIS_RANGE_BY_POOL[poolId]
 }
 
+function getNiceAxisTickSize(range: number) {
+  if (!Number.isFinite(range) || range <= 0) {
+    return 1
+  }
+
+  const roughStep = range / Math.max(CHART_AXIS_TARGET_TICKS - 1, 1)
+  const magnitude = 10 ** Math.floor(Math.log10(roughStep))
+  const normalizedStep = roughStep / magnitude
+  const niceStep =
+    normalizedStep <= 1 ? 1 : normalizedStep <= 2 ? 2 : normalizedStep <= 2.5 ? 2.5 : normalizedStep <= 5 ? 5 : 10
+
+  return niceStep * magnitude
+}
+
+function getNiceChartPriceRange(min: number, max: number, minimumRange: number) {
+  const rawRange = Math.max(max - min, minimumRange)
+  const center = (min + max) / 2
+  const paddedRange = rawRange * (1 + CHART_RANGE_PADDING_RATIO * 2)
+  const paddedMin = center - paddedRange / 2
+  const paddedMax = center + paddedRange / 2
+  const tickSize = getNiceAxisTickSize(paddedRange)
+  const niceMin = Math.floor(paddedMin / tickSize) * tickSize
+  const niceMax = Math.ceil(paddedMax / tickSize) * tickSize
+
+  return {
+    max: Number(niceMax.toFixed(10)),
+    min: Number(niceMin.toFixed(10)),
+    tickSize,
+  }
+}
+
 function getChartPriceRange(
   values: BinanceChartPoint[],
   currentPrice: number,
@@ -414,29 +446,15 @@ function getChartPriceRange(
     const minimumRange = getPoolPriceAxisRange(poolId)
     const priceFloor = Math.min(...prices, currentPrice, anchorPrice)
     const priceCeiling = Math.max(...prices, currentPrice, anchorPrice)
-    const padding = minimumRange * CHART_RANGE_PADDING_RATIO
-    const paddedMin = priceFloor - padding
-    const paddedMax = priceCeiling + padding
-    const visibleRange = Math.max(minimumRange, paddedMax - paddedMin)
-    const center = (paddedMin + paddedMax) / 2
 
-    return {
-      max: center + visibleRange / 2,
-      min: center - visibleRange / 2,
-    }
+    return getNiceChartPriceRange(priceFloor, priceCeiling, minimumRange)
   }
 
   const minPrice = prices.length ? Math.min(...prices, currentPrice) : currentPrice
   const maxPrice = prices.length ? Math.max(...prices, currentPrice) : currentPrice
   const minRange = getPoolPriceAxisRange('btc')
-  const visibleRange = Math.max(maxPrice - minPrice, minRange)
-  const fallbackCenterPrice = (minPrice + maxPrice) / 2
-  const padding = visibleRange * CHART_RANGE_PADDING_RATIO
 
-  return {
-    max: fallbackCenterPrice + visibleRange / 2 + padding,
-    min: fallbackCenterPrice - visibleRange / 2 - padding,
-  }
+  return getNiceChartPriceRange(minPrice, maxPrice, minRange)
 }
 
 function getChartRangeValues(points: BinanceChartPoint[]) {
@@ -464,8 +482,14 @@ function getLiveChartSegments(
   return segments
 }
 
-function getAxisPrices(min: number, max: number) {
-  return [0, 1, 2, 3, 4, 5, 6].map((index) => max - ((max - min) * index) / 6)
+function getAxisPrices(min: number, max: number, tickSize: number) {
+  if (!Number.isFinite(tickSize) || tickSize <= 0) {
+    return [0, 1, 2, 3, 4, 5].map((index) => max - ((max - min) * index) / 5)
+  }
+
+  const tickCount = Math.max(1, Math.round((max - min) / tickSize))
+
+  return Array.from({ length: tickCount + 1 }, (_, index) => Number((max - tickSize * index).toFixed(10)))
 }
 
 function formatMultiplier(multiplierBps: number) {
@@ -484,6 +508,23 @@ function formatUsdcAmount(amount: number) {
 
 function formatUsdcBaseUnits(amount: bigint) {
   return formatUsdcAmount(Number(amount) / 1_000_000)
+}
+
+function formatSignedPercent(value: number) {
+  const sign = value > 0 ? '+' : ''
+
+  return `${sign}${value.toFixed(2)}%`
+}
+
+function getPoolTrend(points: BinanceChartPoint[] | undefined, currentPrice: number) {
+  const firstPrice = points?.find((point) => Number.isFinite(point.price) && point.price > 0)?.price ?? currentPrice
+  const change = currentPrice - firstPrice
+  const percent = firstPrice > 0 ? (change / firstPrice) * 100 : 0
+
+  return {
+    change,
+    percent,
+  }
 }
 
 function getPayoutAmount(multiplierBps: number) {
@@ -610,10 +651,6 @@ function clearPoolPrediction(
   })
 }
 
-function getPredictionRouteLabel() {
-  return AppConfig.magicBlock.enabled ? 'MagicBlock ER' : 'Devnet wallet tx'
-}
-
 function isUserCancelledError(error: unknown) {
   const message = error instanceof Error ? error.message : String(error)
   return /cancel|reject|declin|user.*denied|authorization.*failed/i.test(message)
@@ -625,7 +662,7 @@ function getPoolStartPrice(price: number) {
 
 function getConfiguredUsdcMint() {
   if (!AppConfig.devnetUsdcMint) {
-    throw new Error('Set EXPO_PUBLIC_DEVNET_USDC_MINT to your devnet USDC mint before placing $1 tile predictions.')
+    throw new Error('Prediction currency is not available yet.')
   }
 
   return AppConfig.devnetUsdcMint
@@ -745,9 +782,7 @@ function getDevnetHouseWalletKeypair() {
     return keypairFromHouseWalletSecretBytes(decodeBase58(secretKey))
   } catch (error) {
     throw new Error(
-      `EXPO_PUBLIC_DEVNET_HOUSE_WALLET_SECRET_KEY is invalid. Use a Solana JSON keypair array, base64 secret key, or base58 private key. ${
-        error instanceof Error ? error.message : ''
-      }`.trim(),
+      `Prediction service is not configured correctly. ${error instanceof Error ? error.message : ''}`.trim(),
     )
   }
 }
@@ -984,12 +1019,11 @@ export default function HomeScreen() {
   const currentRoundStartPrice = selectedPoolDisplayChartPoints[0]?.price ?? selectedPoolPrice
   const roundStartPrice = activePrediction?.roundStartPrice ?? currentRoundStartPrice
   const chartRangeValues = getChartRangeValues(selectedPoolDisplayChartPoints)
-  const { max: chartMax, min: chartMin } = getChartPriceRange(
-    chartRangeValues,
-    selectedPoolPrice,
-    selectedPool?.id,
-    roundStartPrice,
-  )
+  const {
+    max: chartMax,
+    min: chartMin,
+    tickSize: chartTickSize,
+  } = getChartPriceRange(chartRangeValues, selectedPoolPrice, selectedPool?.id, roundStartPrice)
   const currentLineY = selectedPool ? getChartY(selectedPoolPrice, chartMin, chartMax) : 0
   const chartSegments = getLiveChartSegments(
     selectedPoolDisplayChartPoints,
@@ -1001,8 +1035,8 @@ export default function HomeScreen() {
   const latestChartPoint = selectedPoolDisplayChartPoints[selectedPoolDisplayChartPoints.length - 1]
   const latestChartX = latestChartPoint ? getChartX(latestChartPoint.timestamp, roundStartMs, chartPlotWidth) : 0
   const latestChartY = latestChartPoint ? getChartY(latestChartPoint.price, chartMin, chartMax) : currentLineY
-  const axisPrices = getAxisPrices(chartMin, chartMax)
-  const axisTickSize = axisPrices.length > 1 ? Math.abs(axisPrices[0] - axisPrices[1]) : 0
+  const axisPrices = getAxisPrices(chartMin, chartMax, chartTickSize)
+  const axisTickSize = chartTickSize
   const phaseBoundaryX = chartPlotWidth / 2
   const tileLayouts = selectedPool
     ? getTileLayouts(chartPlotWidth, chartMin, chartMax, roundStartPrice, selectedPool.id)
@@ -1127,7 +1161,8 @@ export default function HomeScreen() {
           type: 'win',
         }
       : {
-          message: 'Your tile landed outside the final price range. No payout this round, but the next window is already moving.',
+          message:
+            'Your tile landed outside the final price range. No payout this round, but the next window is already moving.',
           settledAtMs: Date.now(),
           title: 'You lost',
           type: 'lose',
@@ -1219,7 +1254,11 @@ export default function HomeScreen() {
   }
 
   async function sendMagicBlockErInstruction(instruction: Instruction, sessionKeypair: Keypair) {
-    return sendSessionInstructions([instruction], sessionKeypair, AppConfig.magicBlock.routerRpcUrl || AppConfig.solanaDevnetRpcUrl)
+    return sendSessionInstructions(
+      [instruction],
+      sessionKeypair,
+      AppConfig.magicBlock.routerRpcUrl || AppConfig.solanaDevnetRpcUrl,
+    )
   }
 
   async function confirmDevnetTransaction(signature: string) {
@@ -1231,21 +1270,14 @@ export default function HomeScreen() {
     const houseWallet = getDevnetHouseWalletKeypair()
 
     if (!houseWallet) {
-      throw new Error('Set EXPO_PUBLIC_DEVNET_HOUSE_WALLET_SECRET_KEY so the house wallet can sponsor MagicBlock session fees.')
+      throw new Error('Prediction service is not ready. Try again soon.')
     }
 
     const connection = new Connection(AppConfig.solanaDevnetRpcUrl, 'confirmed')
     const houseBalance = await connection.getBalance(houseWallet.publicKey)
 
     if (houseBalance < MAGICBLOCK_SESSION_SPONSOR_LAMPORTS) {
-      throw new Error(
-        `Devnet house wallet ${shortenAddress(
-          houseWallet.publicKey.toBase58(),
-          6,
-        )} needs at least ${lamportsToSol(
-          BigInt(MAGICBLOCK_SESSION_SPONSOR_LAMPORTS),
-        )} devnet SOL to sponsor MagicBlock fees.`,
-      )
+      throw new Error('Prediction service is temporarily unavailable. Try again soon.')
     }
 
     const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash()
@@ -1276,13 +1308,13 @@ export default function HomeScreen() {
       return
     }
 
-    setPredictionStatus('MagicBlock session fee balance is low. Refilling from house wallet...')
+    setPredictionStatus('Preparing your prediction...')
     await topUpSessionSolFromHouseWallet(sessionAuthorityAddress)
 
     const updatedSessionSolBalance = await client.rpc.getBalance(solanaAddress(sessionAuthorityAddress)).send()
 
     if (updatedSessionSolBalance.value < BigInt(MAGICBLOCK_MIN_SESSION_LAMPORTS)) {
-      throw new Error('MagicBlock session SOL refill is still confirming. Try the tile again in a few seconds.')
+      throw new Error('Your prediction is still preparing. Try again in a few seconds.')
     }
   }
 
@@ -1299,12 +1331,12 @@ export default function HomeScreen() {
     }
 
     if (magicBlockPredictionReady) {
-      setPredictionStatus('MagicBlock session ready. Tap tiles in this or future rounds.')
+      setPredictionStatus('Ready. Tap a tile to lock your prediction.')
       return
     }
 
     setPreparePendingPoolId(activePool.id)
-    setPredictionStatus('Opening wallet to pre-fund a reusable MagicBlock session...')
+    setPredictionStatus('Opening wallet to prepare predictions...')
 
     try {
       const usdcMintAddress = getConfiguredUsdcMint()
@@ -1320,16 +1352,21 @@ export default function HomeScreen() {
         .send()
 
       if (!programAccount.value) {
-        throw new Error('Tick is not deployed on devnet. Deploy the program before using MagicBlock.')
+        throw new Error('Prediction market is unavailable right now.')
       }
 
       const sessionKeypair = Keypair.generate()
       const sessionAuthorityAddress = sessionKeypair.publicKey.toBase58()
       const sessionExpiresAtMs = Date.now() + AppConfig.magicBlock.sessionTtlSeconds * 1000
-      setPredictionStatus('Funding MagicBlock session fees from house wallet...')
+      setPredictionStatus('Preparing fast predictions...')
       await topUpSessionSolFromHouseWallet(sessionAuthorityAddress)
 
-      const addresses = getTickPredictionAddresses(activePool.symbol, predictorAddress, BigInt(roundStartMs), usdcMintAddress)
+      const addresses = getTickPredictionAddresses(
+        activePool.symbol,
+        predictorAddress,
+        BigInt(roundStartMs),
+        usdcMintAddress,
+      )
       const sessionUsdcAccountAddress = getUserTokenAccountAddress(sessionAuthorityAddress, usdcMintAddress)
       const poolAccount = await client.rpc.getAccountInfo(solanaAddress(addresses.pool), { encoding: 'base64' }).send()
       const usdcMintAccount = await client.rpc
@@ -1351,28 +1388,19 @@ export default function HomeScreen() {
 
       if (usdcDecimals !== 6) {
         throw new Error(
-          `EXPO_PUBLIC_DEVNET_USDC_MINT must be a 6-decimal devnet token. Current mint has ${
-            usdcDecimals ?? 'unknown'
-          } decimals.`,
+          `Prediction currency is not configured correctly. Current token has ${usdcDecimals ?? 'unknown'} decimals.`,
         )
       }
 
       if (!userUsdcAccount?.value) {
-        throw new Error(
-          `Your wallet needs devnet USDC for this game. Create and mint at least $1 of ${shortenAddress(
-            usdcMintAddress,
-            6,
-          )} before predicting.`,
-        )
+        throw new Error(`Your wallet needs at least ${formatUsdcAmount(TILE_STAKE_USDC)} USDC before predicting.`)
       }
 
       const sessionStakeAmount = TILE_STAKE_BASE_UNITS * MAGICBLOCK_SESSION_PREDICTION_CREDITS
 
       if (getSplTokenAccountAmount(userUsdcAccount.value) < sessionStakeAmount) {
         throw new Error(
-          `Your devnet USDC balance is below ${formatUsdcBaseUnits(
-            sessionStakeAmount,
-          )}. Mint more ${shortenAddress(usdcMintAddress, 6)} before starting a MagicBlock session.`,
+          `Your USDC balance is below ${formatUsdcBaseUnits(sessionStakeAmount)}. Add more USDC before predicting.`,
         )
       }
 
@@ -1423,13 +1451,13 @@ export default function HomeScreen() {
           sessionKeypair,
         },
       }))
-      setPredictionStatus(`MagicBlock session funded for ${MAGICBLOCK_SESSION_PREDICTION_CREDITS} rounds: ${shortenAddress(signature, 6)}`)
+      setPredictionStatus(`Predict is ready: ${shortenAddress(signature, 6)}`)
     } catch (error) {
       if (isUserCancelledError(error)) {
         return
       }
 
-      const message = error instanceof Error ? error.message : 'Could not prepare MagicBlock prediction.'
+      const message = error instanceof Error ? error.message : 'Could not prepare predictions.'
       setPredictionStatus(message)
     } finally {
       setPreparePendingPoolId(null)
@@ -1450,12 +1478,12 @@ export default function HomeScreen() {
     }
 
     if (!prepared || prepared.expiresAtMs <= nowMs) {
-      setPredictionStatus('Press Predict once to start a reusable MagicBlock session.')
+      setPredictionStatus('Press Predict to get ready.')
       return
     }
 
     setPendingTileIndex(tileIndex)
-    setPredictionStatus('Funding this round from your MagicBlock session...')
+    setPredictionStatus('Locking your prediction...')
 
     try {
       const usdcMintAddress = getConfiguredUsdcMint()
@@ -1519,7 +1547,7 @@ export default function HomeScreen() {
       }
 
       await sendSessionInstructions(setupInstructions, prepared.sessionKeypair, AppConfig.solanaDevnetRpcUrl)
-      setPredictionStatus('Sending tile to MagicBlock...')
+      setPredictionStatus('Locking tile...')
 
       const signature = await sendMagicBlockErInstruction(
         getSelectTileOnErInstruction({
@@ -1542,10 +1570,10 @@ export default function HomeScreen() {
         },
       }))
       setPredictionStatus(
-        `${formatMultiplier(TILE_MULTIPLIERS_BPS[tileIndex])} locked via MagicBlock: ${shortenAddress(signature, 6)}`,
+        `${formatMultiplier(TILE_MULTIPLIERS_BPS[tileIndex])} locked: ${shortenAddress(signature, 6)}`,
       )
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Could not select tile on MagicBlock.'
+      const message = error instanceof Error ? error.message : 'Could not lock tile.'
       setPredictionStatus(message)
     } finally {
       setPendingTileIndex(null)
@@ -1583,7 +1611,7 @@ export default function HomeScreen() {
         .send()
 
       if (!programAccount.value) {
-        throw new Error('Tick is not deployed on the selected network. Switch to devnet after deploying the program.')
+        throw new Error('Prediction market is unavailable right now.')
       }
 
       const roundId = BigInt(roundStartMs)
@@ -1610,24 +1638,17 @@ export default function HomeScreen() {
 
       if (usdcDecimals !== 6) {
         throw new Error(
-          `EXPO_PUBLIC_DEVNET_USDC_MINT must be a 6-decimal devnet token. Current mint has ${
-            usdcDecimals ?? 'unknown'
-          } decimals.`,
+          `Prediction currency is not configured correctly. Current token has ${usdcDecimals ?? 'unknown'} decimals.`,
         )
       }
 
       if (!userUsdcAccount?.value) {
-        throw new Error(
-          `Your wallet needs devnet USDC for this game. Create and mint at least $1 of ${shortenAddress(
-            usdcMintAddress,
-            6,
-          )} before predicting.`,
-        )
+        throw new Error(`Your wallet needs at least ${formatUsdcAmount(TILE_STAKE_USDC)} USDC before predicting.`)
       }
 
       if (getSplTokenAccountAmount(userUsdcAccount.value) < 1_000_000n) {
         throw new Error(
-          `Your devnet USDC balance is below $1. Mint more ${shortenAddress(usdcMintAddress, 6)} before predicting.`,
+          `Your USDC balance is below ${formatUsdcAmount(TILE_STAKE_USDC)}. Add more USDC before predicting.`,
         )
       }
 
@@ -1676,10 +1697,7 @@ export default function HomeScreen() {
         },
       }))
       setPredictionStatus(
-        `${formatMultiplier(TILE_MULTIPLIERS_BPS[tileIndex])} placed for $1 via ${getPredictionRouteLabel()}: ${shortenAddress(
-          signature,
-          6,
-        )}`,
+        `${formatMultiplier(TILE_MULTIPLIERS_BPS[tileIndex])} locked: ${shortenAddress(signature, 6)}`,
       )
     } catch (error) {
       if (isUserCancelledError(error)) {
@@ -1769,7 +1787,7 @@ export default function HomeScreen() {
       }
 
       if (AppConfig.magicBlock.enabled) {
-        setPredictionStatus('Committing your MagicBlock prediction back to Solana...')
+        setPredictionStatus('Finalizing your prediction...')
         await sendTransactions([
           getUndelegatePredictionInstruction({
             claimantAddress,
@@ -2133,8 +2151,8 @@ export default function HomeScreen() {
                       <Text style={appStyles.tileSummaryValue}>{predictionOpen ? 'OPEN' : 'CLOSED'}</Text>
                     </View>
                     <View style={appStyles.tileSummaryItemWide}>
-                      <Text style={appStyles.tileSummaryLabel}>ROUTE</Text>
-                      <Text style={appStyles.tileSummaryValue}>{getPredictionRouteLabel()}</Text>
+                      <Text style={appStyles.tileSummaryLabel}>TOP TILE</Text>
+                      <Text style={appStyles.tileSummaryValue}>{formatMultiplier(TILE_MULTIPLIERS_BPS[0])}</Text>
                     </View>
                   </View>
                   {AppConfig.magicBlock.enabled && !activePrediction ? (
@@ -2210,7 +2228,7 @@ export default function HomeScreen() {
                     <Text style={appStyles.predictionStatus}>
                       {predictionOpen
                         ? AppConfig.magicBlock.enabled && !magicBlockPredictionReady
-                          ? 'Press Predict once, then tap tiles across rounds.'
+                          ? 'Press Predict once, then tap a tile.'
                           : 'Tap one settlement tile before 30 seconds.'
                         : 'Prediction window closed.'}
                     </Text>
@@ -2220,32 +2238,88 @@ export default function HomeScreen() {
               </View>
             ) : (
               <ScrollView contentContainerStyle={appStyles.poolList} showsVerticalScrollIndicator={false}>
-                {POOLS.map((pool) => (
-                  <Pressable
-                    accessibilityRole="button"
-                    key={pool.id}
-                    onPress={() => setSelectedPool(pool)}
-                    style={({ pressed }) => [appStyles.poolCard, pressed && appStyles.poolCardPressed]}
-                  >
-                    <View style={[appStyles.poolLogo, { borderColor: pool.accent }]}>
-                      <Image source={pool.logo} style={appStyles.poolLogoImage} />
+                <View style={appStyles.poolListHeader}>
+                  <Text style={appStyles.poolListEyebrow}>LIVE MARKETS</Text>
+                  <Text style={appStyles.poolListTitle}>Markets</Text>
+                  <View style={appStyles.poolListStats}>
+                    <View style={appStyles.poolListStat}>
+                      <Text style={appStyles.poolListStatLabel}>ROUND</Text>
+                      <Text style={appStyles.poolListStatValue}>{formatRoundTimer(roundRemainingMs)}</Text>
                     </View>
-
-                    <View style={appStyles.poolCardContent}>
-                      <Text style={appStyles.poolCardTitle}>{pool.name}</Text>
-                      <Text style={appStyles.poolCardTime}>1 min</Text>
+                    <View style={appStyles.poolListStat}>
+                      <Text style={appStyles.poolListStatLabel}>STAKE</Text>
+                      <Text style={appStyles.poolListStatValue}>{formatUsdcAmount(TILE_STAKE_USDC)}</Text>
                     </View>
+                    <View style={appStyles.poolListStatWide}>
+                      <Text style={appStyles.poolListStatLabel}>WINDOW</Text>
+                      <Text style={appStyles.poolListStatValue}>1 MIN</Text>
+                    </View>
+                  </View>
+                </View>
+                {POOLS.map((pool) => {
+                  const livePrice = poolMarketData[pool.id]?.price ?? pool.currentPrice
+                  const trend = getPoolTrend(poolMarketData[pool.id]?.chartPoints, livePrice)
+                  const trendUp = trend.change >= 0
 
-                    <View style={appStyles.poolCardFooter}>
-                      <Text style={appStyles.poolCardPrice}>
-                        Current price : {formatPoolPrice(poolMarketData[pool.id]?.price ?? pool.currentPrice)}
-                      </Text>
-                      <View style={appStyles.tickItButton}>
-                        <Text style={appStyles.tickItButtonText}>tick it</Text>
+                  return (
+                    <Pressable
+                      accessibilityLabel={`${pool.symbol} prediction market`}
+                      accessibilityRole="button"
+                      key={pool.id}
+                      onPress={() => setSelectedPool(pool)}
+                      style={({ pressed }) => [appStyles.poolCard, pressed && appStyles.poolCardPressed]}
+                    >
+                      <View style={[appStyles.poolCardAccent, { backgroundColor: pool.accent }]} />
+                      <View style={appStyles.poolCardTop}>
+                        <View style={[appStyles.poolLogo, { borderColor: `${pool.accent}70` }]}>
+                          <Image source={pool.logo} style={appStyles.poolLogoImage} />
+                        </View>
+                        <View style={appStyles.poolCardContent}>
+                          <Text style={appStyles.poolCardTitle}>{pool.symbol}</Text>
+                          <Text style={appStyles.poolCardTime}>1 min round</Text>
+                        </View>
+                        <View style={[appStyles.poolStatusPill, { borderColor: `${pool.accent}5c` }]}>
+                          <Text style={[appStyles.poolStatusPillText, { color: pool.accent }]}>LIVE</Text>
+                        </View>
                       </View>
-                    </View>
-                  </Pressable>
-                ))}
+
+                      <View style={appStyles.poolCardMarketRow}>
+                        <View style={appStyles.poolPriceGroup}>
+                          <Text style={appStyles.poolCardPrice}>{formatPoolPrice(livePrice)}</Text>
+                          <Text style={appStyles.poolCardMeta}>{pool.name}</Text>
+                        </View>
+                        <View
+                          style={[
+                            appStyles.poolTrendBadge,
+                            trendUp ? appStyles.poolTrendBadgeUp : appStyles.poolTrendBadgeDown,
+                          ]}
+                        >
+                          <Ionicons
+                            color={trendUp ? '#b8ff66' : '#ff8b8b'}
+                            name={trendUp ? 'trending-up' : 'trending-down'}
+                            size={14}
+                          />
+                          <Text
+                            style={[
+                              appStyles.poolTrendBadgeText,
+                              trendUp ? appStyles.poolTrendTextUp : appStyles.poolTrendTextDown,
+                            ]}
+                          >
+                            {formatSignedPercent(trend.percent)}
+                          </Text>
+                        </View>
+                      </View>
+
+                      <View style={appStyles.poolCardFooter}>
+                        <Text style={appStyles.poolCardFooterText}>Settlement tiles</Text>
+                        <View style={appStyles.tickItButton}>
+                          <Text style={appStyles.tickItButtonText}>OPEN</Text>
+                          <Ionicons color="#000000" name="arrow-forward" size={15} />
+                        </View>
+                      </View>
+                    </Pressable>
+                  )
+                })}
               </ScrollView>
             )}
           </View>
@@ -2270,7 +2344,9 @@ export default function HomeScreen() {
                   <View
                     style={[
                       appStyles.resultFeedbackIcon,
-                      resultFeedback.type === 'win' ? appStyles.resultFeedbackIconWin : appStyles.resultFeedbackIconLose,
+                      resultFeedback.type === 'win'
+                        ? appStyles.resultFeedbackIconWin
+                        : appStyles.resultFeedbackIconLose,
                     ]}
                   >
                     <Ionicons

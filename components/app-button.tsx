@@ -1,15 +1,7 @@
 import { Pressable, Text } from 'react-native'
 import { appStyles } from '@/constants/app-styles'
 
-export function AppButton({
-  disabled,
-  onPress,
-  title,
-}: {
-  disabled?: boolean
-  onPress: () => void
-  title: string
-}) {
+export function AppButton({ disabled, onPress, title }: { disabled?: boolean; onPress: () => void; title: string }) {
   return (
     <Pressable
       accessibilityRole="button"

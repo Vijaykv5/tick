@@ -159,10 +159,7 @@ async function fetchCoinbaseSpotPrice(poolId: BinancePoolId) {
   return price
 }
 
-async function fetchCoinbasePriceHistory(
-  poolId: BinancePoolId,
-  roundStartMs: number,
-): Promise<BinancePriceHistory> {
+async function fetchCoinbasePriceHistory(poolId: BinancePoolId, roundStartMs: number): Promise<BinancePriceHistory> {
   const price = await fetchCoinbaseSpotPrice(poolId)
   const now = Date.now()
   const chartPoints = [

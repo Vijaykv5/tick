@@ -71,7 +71,10 @@ pub mod tick_prediction {
         )
     }
 
-    pub fn authorize_pool_session(ctx: Context<AuthorizePoolSession>, expires_at: i64) -> Result<()> {
+    pub fn authorize_pool_session(
+        ctx: Context<AuthorizePoolSession>,
+        expires_at: i64,
+    ) -> Result<()> {
         let now = Clock::get()?.unix_timestamp;
 
         require!(expires_at > now, TickError::InvalidSessionExpiry);
@@ -346,7 +349,10 @@ pub mod tick_prediction {
             ctx.accounts.pool.authority == ctx.accounts.authority.key(),
             TickError::Unauthorized
         );
-        require!(ctx.accounts.round.status == RoundStatus::Settled, TickError::RoundNotSettled);
+        require!(
+            ctx.accounts.round.status == RoundStatus::Settled,
+            TickError::RoundNotSettled
+        );
         require!(!ctx.accounts.prediction.claimed, TickError::AlreadyClaimed);
         require!(
             ctx.accounts.prediction.tile_index == ctx.accounts.round.winning_tile_index,
@@ -407,7 +413,6 @@ pub mod tick_prediction {
 
         Ok(())
     }
-
 }
 
 #[derive(Accounts)]
