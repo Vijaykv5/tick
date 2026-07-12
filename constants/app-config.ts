@@ -7,7 +7,12 @@ export class AppConfig {
     process.env.EXPO_PUBLIC_SOLANA_DEVNET_RPC_URL ??
     'https://api.devnet.solana.com'
   static magicBlock = {
-    erRpcUrl: process.env.EXPO_PUBLIC_MAGICBLOCK_ER_RPC_URL ?? '',
+    enabled: process.env.EXPO_PUBLIC_MAGICBLOCK_ENABLED === 'true',
+    erValidator:
+      process.env.EXPO_PUBLIC_MAGICBLOCK_ER_VALIDATOR ??
+      'MAS1Dt9qreoRMQ14YQuhg8UTZMMzDdKhmkZMECCzk57',
+    routerRpcUrl: process.env.EXPO_PUBLIC_MAGICBLOCK_ROUTER_RPC_URL ?? '',
+    routerWsUrl: process.env.EXPO_PUBLIC_MAGICBLOCK_ROUTER_WS_URL ?? '',
     sessionTtlSeconds: Number(process.env.EXPO_PUBLIC_MAGICBLOCK_SESSION_TTL_SECONDS ?? 900),
   }
   static networks: SolanaCluster[] = [

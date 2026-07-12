@@ -1,0 +1,24 @@
+[package]
+name = "ephemeral-rollups-sdk"
+description = "Ephemeral Rollups Integration SDK"
+version = { workspace = true }
+authors = { workspace = true }
+repository = { workspace = true }
+documentation = { workspace = true }
+homepage = { workspace = true }
+keywords = { workspace = true }
+readme = { workspace = true }
+license = { workspace = true }
+edition = { workspace = true }
+
+[features]
+default = []
+anchor = ["anchor-lang"]
+
+[dependencies]
+anchor-lang = { workspace = true, optional = true }
+borsh = { workspace = true }
+ephemeral-rollups-sdk-attribute-delegate = { workspace = true }
+ephemeral-rollups-sdk-attribute-ephemeral = { workspace = true }
+ephemeral-rollups-sdk-attribute-commit = { workspace = true }
+solana-program = { workspace = true }

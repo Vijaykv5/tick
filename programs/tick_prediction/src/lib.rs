@@ -1,5 +1,8 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Mint, Token, TokenAccount, TransferChecked};
+use ephemeral_rollups_sdk::anchor::{commit, delegate, ephemeral};
+use ephemeral_rollups_sdk::cpi::DelegateConfig;
+use ephemeral_rollups_sdk::ephem::{commit_accounts, commit_and_undelegate_accounts};
 
 declare_id!("4gaZzuoNzEWUtRnLSFeHABQTn2hPxKy3V5qeVsUSYaJz");
 
@@ -14,6 +17,7 @@ const USDC_DECIMALS: u8 = 6;
 const POOL_SEED: &[u8] = b"pool_v2";
 const MULTIPLIER_BPS: [u32; TILE_COUNT] = [3_000, 2_000, 1_250, 1_000, 500, 300, 250, 200, 150];
 
+#[ephemeral]
 #[program]
 pub mod tick_prediction {
     use super::*;
@@ -56,32 +60,59 @@ pub mod tick_prediction {
         starts_at: i64,
         ends_at: i64,
     ) -> Result<()> {
-        require!(start_price > 0, TickError::InvalidPrice);
-        require!(ends_at > starts_at, TickError::InvalidRoundWindow);
-        require!(
-            ends_at
-                .checked_sub(starts_at)
-                .ok_or(TickError::InvalidRoundWindow)?
-                == ctx.accounts.pool.duration_seconds,
-            TickError::InvalidRoundWindow
-        );
+        write_round(
+            &ctx.accounts.pool,
+            &mut ctx.accounts.round,
+            round_id,
+            start_price,
+            starts_at,
+            ends_at,
+            ctx.bumps.round,
+        )
+    }
 
-        let round = &mut ctx.accounts.round;
-        round.pool = ctx.accounts.pool.key();
-        round.round_id = round_id;
-        round.start_price = start_price;
-        round.final_price = 0;
-        round.starts_at = starts_at;
-        round.ends_at = ends_at;
-        round.status = RoundStatus::Open;
-        round.winning_tile_index = u8::MAX;
-        round.tile_width_bps = price_axis_range(&ctx.accounts.pool.symbol)?
-            .checked_div(TILE_COUNT as i64)
-            .ok_or(TickError::MathOverflow)?;
-        round.multipliers_bps = MULTIPLIER_BPS;
-        round.bump = ctx.bumps.round;
+    pub fn authorize_pool_session(ctx: Context<AuthorizePoolSession>, expires_at: i64) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+
+        require!(expires_at > now, TickError::InvalidSessionExpiry);
+
+        let pool_session = &mut ctx.accounts.pool_session;
+        pool_session.pool = ctx.accounts.pool.key();
+        pool_session.authority = ctx.accounts.authority.key();
+        pool_session.session_authority = ctx.accounts.session_authority.key();
+        pool_session.expires_at = expires_at;
+        pool_session.bump = ctx.bumps.pool_session;
 
         Ok(())
+    }
+
+    pub fn open_round_with_session(
+        ctx: Context<OpenRoundWithSession>,
+        round_id: u64,
+        start_price: i64,
+        starts_at: i64,
+        ends_at: i64,
+    ) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+
+        require!(
+            ctx.accounts.pool_session.session_authority == ctx.accounts.session_authority.key(),
+            TickError::InvalidSessionAuthority
+        );
+        require!(
+            ctx.accounts.pool_session.expires_at >= now,
+            TickError::SessionExpired
+        );
+
+        write_round(
+            &ctx.accounts.pool,
+            &mut ctx.accounts.round,
+            round_id,
+            start_price,
+            starts_at,
+            ends_at,
+            ctx.bumps.round,
+        )
     }
 
     pub fn place_tile_prediction(ctx: Context<PlaceTilePrediction>, tile_index: u8) -> Result<()> {
@@ -121,6 +152,7 @@ pub mod tick_prediction {
         let prediction = &mut ctx.accounts.prediction;
         prediction.round = round.key();
         prediction.predictor = ctx.accounts.predictor.key();
+        prediction.session_authority = ctx.accounts.predictor.key();
         prediction.tile_index = tile_index;
         prediction.stake_amount = STAKE_AMOUNT;
         prediction.multiplier_bps = round.multipliers_bps[tile_index as usize];
@@ -131,17 +163,176 @@ pub mod tick_prediction {
         Ok(())
     }
 
-    pub fn settle_round(ctx: Context<SettleRound>, final_price: i64) -> Result<()> {
-        require!(final_price > 0, TickError::InvalidPrice);
+    pub fn fund_prediction(ctx: Context<FundPrediction>) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        let round = &ctx.accounts.round;
+
+        require!(round.status == RoundStatus::Open, TickError::RoundNotOpen);
+        require!(now >= round.starts_at, TickError::RoundNotStarted);
         require!(
-            ctx.accounts.round.status == RoundStatus::Open,
-            TickError::RoundNotOpen
+            now < round.starts_at + ctx.accounts.pool.prediction_window_seconds,
+            TickError::PredictionWindowClosed
+        );
+        require!(
+            ctx.accounts.predictor_token_account.mint == ctx.accounts.pool.usdc_mint,
+            TickError::InvalidMint
+        );
+        require!(
+            ctx.accounts.predictor_token_account.owner == ctx.accounts.payer.key(),
+            TickError::InvalidPredictorTokenAccount
+        );
+        require!(
+            ctx.accounts.predictor.key() == ctx.accounts.payer.key()
+                || ctx.accounts.session_authority.key() == ctx.accounts.payer.key(),
+            TickError::InvalidPredictor
+        );
+        require!(
+            ctx.accounts.vault.key() == ctx.accounts.pool.vault,
+            TickError::InvalidVault
         );
 
-        let now = Clock::get()?.unix_timestamp;
-        require!(now >= ctx.accounts.round.ends_at, TickError::RoundNotEnded);
+        token::transfer_checked(
+            CpiContext::new(
+                ctx.accounts.token_program.key(),
+                TransferChecked {
+                    from: ctx.accounts.predictor_token_account.to_account_info(),
+                    mint: ctx.accounts.usdc_mint.to_account_info(),
+                    to: ctx.accounts.vault.to_account_info(),
+                    authority: ctx.accounts.payer.to_account_info(),
+                },
+            ),
+            STAKE_AMOUNT,
+            USDC_DECIMALS,
+        )?;
 
+        let prediction = &mut ctx.accounts.prediction;
+        prediction.round = round.key();
+        prediction.predictor = ctx.accounts.predictor.key();
+        prediction.session_authority = ctx.accounts.session_authority.key();
+        prediction.tile_index = u8::MAX;
+        prediction.stake_amount = STAKE_AMOUNT;
+        prediction.multiplier_bps = 0;
+        prediction.created_at = now;
+        prediction.claimed = false;
+        prediction.bump = ctx.bumps.prediction;
+
+        Ok(())
+    }
+
+    pub fn select_tile_on_er(ctx: Context<SelectTileOnEr>, tile_index: u8) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        let round = &ctx.accounts.round;
+
+        require!(tile_index < TILE_COUNT_U8, TickError::InvalidTile);
+        require!(round.status == RoundStatus::Open, TickError::RoundNotOpen);
+        require!(now >= round.starts_at, TickError::RoundNotStarted);
+        require!(
+            now < round.starts_at + ctx.accounts.pool.prediction_window_seconds,
+            TickError::PredictionWindowClosed
+        );
+        require!(
+            ctx.accounts.prediction.tile_index == u8::MAX,
+            TickError::PredictionAlreadySelected
+        );
+        require!(
+            ctx.accounts.prediction.session_authority == ctx.accounts.session_authority.key(),
+            TickError::InvalidSessionAuthority
+        );
+
+        let prediction = &mut ctx.accounts.prediction;
+        prediction.tile_index = tile_index;
+        prediction.multiplier_bps = round.multipliers_bps[tile_index as usize];
+
+        Ok(())
+    }
+
+    pub fn delegate_round(ctx: Context<DelegateRound>, round_id: u64) -> Result<()> {
+        let pool_key = ctx.accounts.pool.key();
+        let round_id_seed = round_id.to_le_bytes();
+
+        ctx.accounts.delegate_pda(
+            &ctx.accounts.payer,
+            &[b"round", pool_key.as_ref(), &round_id_seed],
+            DelegateConfig {
+                validator: ctx.remaining_accounts.first().map(|account| account.key()),
+                ..Default::default()
+            },
+        )?;
+
+        Ok(())
+    }
+
+    pub fn delegate_prediction(ctx: Context<DelegatePrediction>) -> Result<()> {
+        let round_key = ctx.accounts.round.key();
+        let predictor_key = ctx.accounts.predictor.key();
+
+        ctx.accounts.delegate_pda(
+            &ctx.accounts.payer,
+            &[b"prediction", round_key.as_ref(), predictor_key.as_ref()],
+            DelegateConfig {
+                validator: ctx.remaining_accounts.first().map(|account| account.key()),
+                ..Default::default()
+            },
+        )?;
+
+        Ok(())
+    }
+
+    pub fn commit_round(ctx: Context<CommitRound>) -> Result<()> {
+        let payer = ctx.accounts.payer.to_account_info();
+        let round = ctx.accounts.round.to_account_info();
+        let magic_context = ctx.accounts.magic_context.to_account_info();
+        let magic_program = ctx.accounts.magic_program.to_account_info();
+        commit_accounts(&payer, vec![&round], &magic_context, &magic_program)?;
+
+        Ok(())
+    }
+
+    pub fn commit_prediction(ctx: Context<CommitPrediction>) -> Result<()> {
+        let payer = ctx.accounts.payer.to_account_info();
+        let prediction = ctx.accounts.prediction.to_account_info();
+        let magic_context = ctx.accounts.magic_context.to_account_info();
+        let magic_program = ctx.accounts.magic_program.to_account_info();
+        commit_accounts(&payer, vec![&prediction], &magic_context, &magic_program)?;
+
+        Ok(())
+    }
+
+    pub fn undelegate_round(ctx: Context<CommitRound>) -> Result<()> {
+        ctx.accounts.round.exit(&crate::ID)?;
+        let payer = ctx.accounts.payer.to_account_info();
+        let round = ctx.accounts.round.to_account_info();
+        let magic_context = ctx.accounts.magic_context.to_account_info();
+        let magic_program = ctx.accounts.magic_program.to_account_info();
+        commit_and_undelegate_accounts(&payer, vec![&round], &magic_context, &magic_program)?;
+
+        Ok(())
+    }
+
+    pub fn undelegate_prediction(ctx: Context<CommitPrediction>) -> Result<()> {
+        ctx.accounts.prediction.exit(&crate::ID)?;
+        let payer = ctx.accounts.payer.to_account_info();
+        let prediction = ctx.accounts.prediction.to_account_info();
+        let magic_context = ctx.accounts.magic_context.to_account_info();
+        let magic_program = ctx.accounts.magic_program.to_account_info();
+        commit_and_undelegate_accounts(&payer, vec![&prediction], &magic_context, &magic_program)?;
+
+        Ok(())
+    }
+
+    pub fn settle_round(ctx: Context<SettleRound>, final_price: i64) -> Result<()> {
+        require!(
+            ctx.accounts.pool.authority == ctx.accounts.authority.key(),
+            TickError::Unauthorized
+        );
+        require!(final_price > 0, TickError::InvalidPrice);
+
+        let now = Clock::get()?.unix_timestamp;
         let round = &mut ctx.accounts.round;
+
+        require!(round.status == RoundStatus::Open, TickError::RoundNotOpen);
+        require!(now >= round.ends_at, TickError::RoundNotEnded);
+
         round.final_price = final_price;
         round.winning_tile_index =
             price_to_tile_index(round.start_price, final_price, &ctx.accounts.pool.symbol)?;
@@ -152,17 +343,14 @@ pub mod tick_prediction {
 
     pub fn claim_payout(ctx: Context<ClaimPayout>) -> Result<()> {
         require!(
-            ctx.accounts.round.status == RoundStatus::Settled,
-            TickError::RoundNotSettled
+            ctx.accounts.pool.authority == ctx.accounts.authority.key(),
+            TickError::Unauthorized
         );
+        require!(ctx.accounts.round.status == RoundStatus::Settled, TickError::RoundNotSettled);
         require!(!ctx.accounts.prediction.claimed, TickError::AlreadyClaimed);
         require!(
             ctx.accounts.prediction.tile_index == ctx.accounts.round.winning_tile_index,
             TickError::PredictionLost
-        );
-        require!(
-            ctx.accounts.vault.key() == ctx.accounts.pool.vault,
-            TickError::InvalidVault
         );
         require!(
             ctx.accounts.claimant_token_account.mint == ctx.accounts.pool.usdc_mint,
@@ -172,8 +360,12 @@ pub mod tick_prediction {
             ctx.accounts.claimant_token_account.owner == ctx.accounts.prediction.predictor,
             TickError::InvalidClaimantTokenAccount
         );
+        require!(
+            ctx.accounts.vault.key() == ctx.accounts.pool.vault,
+            TickError::InvalidVault
+        );
 
-        let payout_amount = ctx
+        let payout = ctx
             .accounts
             .prediction
             .stake_amount
@@ -184,9 +376,8 @@ pub mod tick_prediction {
                 profit_amount.checked_add(ctx.accounts.prediction.stake_amount)
             })
             .ok_or(TickError::MathOverflow)?;
-
         require!(
-            ctx.accounts.vault.amount >= payout_amount,
+            ctx.accounts.vault.amount >= payout,
             TickError::InsufficientVaultFunds
         );
 
@@ -208,7 +399,7 @@ pub mod tick_prediction {
                 },
                 &[signer_seeds],
             ),
-            payout_amount,
+            payout,
             USDC_DECIMALS,
         )?;
 
@@ -216,6 +407,7 @@ pub mod tick_prediction {
 
         Ok(())
     }
+
 }
 
 #[derive(Accounts)]
@@ -270,6 +462,60 @@ pub struct OpenRound<'info> {
 }
 
 #[derive(Accounts)]
+pub struct AuthorizePoolSession<'info> {
+    #[account(has_one = authority)]
+    pub pool: Account<'info, Pool>,
+    #[account(
+        init,
+        payer = authority,
+        space = PoolSession::SPACE,
+        seeds = [
+            b"pool_session",
+            pool.key().as_ref(),
+            authority.key().as_ref(),
+            session_authority.key().as_ref()
+        ],
+        bump
+    )]
+    pub pool_session: Account<'info, PoolSession>,
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    /// CHECK: Short-lived signer authorized by the pool authority.
+    pub session_authority: UncheckedAccount<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+#[instruction(round_id: u64)]
+pub struct OpenRoundWithSession<'info> {
+    #[account(has_one = authority)]
+    pub pool: Account<'info, Pool>,
+    #[account(
+        seeds = [
+            b"pool_session",
+            pool.key().as_ref(),
+            authority.key().as_ref(),
+            session_authority.key().as_ref()
+        ],
+        bump = pool_session.bump
+    )]
+    pub pool_session: Account<'info, PoolSession>,
+    /// CHECK: Pool authority used as a PDA seed.
+    pub authority: UncheckedAccount<'info>,
+    #[account(mut)]
+    pub session_authority: Signer<'info>,
+    #[account(
+        init,
+        payer = session_authority,
+        space = Round::SPACE,
+        seeds = [b"round", pool.key().as_ref(), &round_id.to_le_bytes()],
+        bump
+    )]
+    pub round: Account<'info, Round>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
 pub struct PlaceTilePrediction<'info> {
     pub pool: Account<'info, Pool>,
     #[account(
@@ -295,6 +541,134 @@ pub struct PlaceTilePrediction<'info> {
     pub usdc_mint: Account<'info, Mint>,
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct FundPrediction<'info> {
+    pub pool: Account<'info, Pool>,
+    #[account(
+        seeds = [b"round", round.pool.as_ref(), &round.round_id.to_le_bytes()],
+        bump = round.bump,
+        has_one = pool
+    )]
+    pub round: Account<'info, Round>,
+    #[account(
+        init,
+        payer = payer,
+        space = TilePrediction::SPACE,
+        seeds = [b"prediction", round.key().as_ref(), predictor.key().as_ref()],
+        bump
+    )]
+    pub prediction: Account<'info, TilePrediction>,
+    /// CHECK: Prediction owner and payout recipient. The payer funds the stake.
+    pub predictor: UncheckedAccount<'info>,
+    /// CHECK: Short-lived signer allowed to select the tile on the Ephemeral Rollup.
+    pub session_authority: UncheckedAccount<'info>,
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    #[account(mut)]
+    pub predictor_token_account: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub vault: Account<'info, TokenAccount>,
+    pub usdc_mint: Account<'info, Mint>,
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct SelectTileOnEr<'info> {
+    pub pool: Account<'info, Pool>,
+    #[account(
+        seeds = [b"round", round.pool.as_ref(), &round.round_id.to_le_bytes()],
+        bump = round.bump,
+        has_one = pool
+    )]
+    pub round: Account<'info, Round>,
+    #[account(
+        mut,
+        seeds = [b"prediction", round.key().as_ref(), predictor.key().as_ref()],
+        bump = prediction.bump,
+        has_one = round
+    )]
+    pub prediction: Account<'info, TilePrediction>,
+    /// CHECK: Prediction owner used as a PDA seed.
+    pub predictor: UncheckedAccount<'info>,
+    pub session_authority: Signer<'info>,
+}
+
+#[delegate]
+#[derive(Accounts)]
+#[instruction(round_id: u64)]
+pub struct DelegateRound<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    pub pool: Account<'info, Pool>,
+    /// CHECK: The round PDA is delegated by MagicBlock's delegation program.
+    #[account(
+        mut,
+        del,
+        seeds = [b"round", pool.key().as_ref(), &round_id.to_le_bytes()],
+        bump
+    )]
+    pub pda: AccountInfo<'info>,
+}
+
+#[delegate]
+#[derive(Accounts)]
+pub struct DelegatePrediction<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    #[account(
+        seeds = [b"round", round.pool.as_ref(), &round.round_id.to_le_bytes()],
+        bump = round.bump
+    )]
+    pub round: Account<'info, Round>,
+    /// CHECK: Used as a PDA seed; payer normally matches predictor in the client flow.
+    pub predictor: UncheckedAccount<'info>,
+    /// CHECK: The prediction PDA is delegated by MagicBlock's delegation program.
+    #[account(
+        mut,
+        del,
+        seeds = [b"prediction", round.key().as_ref(), predictor.key().as_ref()],
+        bump
+    )]
+    pub pda: AccountInfo<'info>,
+}
+
+#[commit]
+#[derive(Accounts)]
+pub struct CommitRound<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [b"round", round.pool.as_ref(), &round.round_id.to_le_bytes()],
+        bump = round.bump
+    )]
+    pub round: Account<'info, Round>,
+    /// CHECK: Your program ID, required by MagicBlock commit account routing.
+    pub program_id: AccountInfo<'info>,
+}
+
+#[commit]
+#[derive(Accounts)]
+pub struct CommitPrediction<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    #[account(
+        seeds = [b"round", round.pool.as_ref(), &round.round_id.to_le_bytes()],
+        bump = round.bump
+    )]
+    pub round: Account<'info, Round>,
+    #[account(
+        mut,
+        seeds = [b"prediction", round.key().as_ref(), prediction.predictor.as_ref()],
+        bump = prediction.bump,
+        has_one = round
+    )]
+    pub prediction: Account<'info, TilePrediction>,
+    /// CHECK: Your program ID, required by MagicBlock commit account routing.
+    pub program_id: AccountInfo<'info>,
 }
 
 #[derive(Accounts)]
@@ -360,6 +734,19 @@ impl Pool {
 }
 
 #[account]
+pub struct PoolSession {
+    pub pool: Pubkey,
+    pub authority: Pubkey,
+    pub session_authority: Pubkey,
+    pub expires_at: i64,
+    pub bump: u8,
+}
+
+impl PoolSession {
+    pub const SPACE: usize = 8 + 32 + 32 + 32 + 8 + 1;
+}
+
+#[account]
 pub struct Round {
     pub pool: Pubkey,
     pub round_id: u64,
@@ -382,6 +769,7 @@ impl Round {
 pub struct TilePrediction {
     pub round: Pubkey,
     pub predictor: Pubkey,
+    pub session_authority: Pubkey,
     pub tile_index: u8,
     pub stake_amount: u64,
     pub multiplier_bps: u32,
@@ -391,7 +779,7 @@ pub struct TilePrediction {
 }
 
 impl TilePrediction {
-    pub const SPACE: usize = 8 + 32 + 32 + 1 + 8 + 4 + 8 + 1 + 1;
+    pub const SPACE: usize = 8 + 32 + 32 + 32 + 1 + 8 + 4 + 8 + 1 + 1;
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq)]
@@ -430,6 +818,10 @@ pub enum TickError {
     Unauthorized,
     #[msg("USDC mint is invalid")]
     InvalidMint,
+    #[msg("Predictor must match the funding payer")]
+    InvalidPredictor,
+    #[msg("Predictor token account must belong to the funding payer")]
+    InvalidPredictorTokenAccount,
     #[msg("Pool vault is invalid")]
     InvalidVault,
     #[msg("Claimant token account must belong to the prediction owner")]
@@ -438,6 +830,14 @@ pub enum TickError {
     PredictionLost,
     #[msg("Payout has already been claimed")]
     AlreadyClaimed,
+    #[msg("Prediction already selected a tile")]
+    PredictionAlreadySelected,
+    #[msg("Session authority is invalid")]
+    InvalidSessionAuthority,
+    #[msg("Session expiry is invalid")]
+    InvalidSessionExpiry,
+    #[msg("Session has expired")]
+    SessionExpired,
     #[msg("Vault does not have enough funds")]
     InsufficientVaultFunds,
     #[msg("Math overflow")]
@@ -454,6 +854,42 @@ fn symbol_to_bytes(symbol: &str) -> Result<[u8; SYMBOL_BYTES]> {
     let mut bytes = [0_u8; SYMBOL_BYTES];
     bytes[..symbol.len()].copy_from_slice(symbol.as_bytes());
     Ok(bytes)
+}
+
+fn write_round(
+    pool: &Account<Pool>,
+    round: &mut Account<Round>,
+    round_id: u64,
+    start_price: i64,
+    starts_at: i64,
+    ends_at: i64,
+    bump: u8,
+) -> Result<()> {
+    require!(start_price > 0, TickError::InvalidPrice);
+    require!(ends_at > starts_at, TickError::InvalidRoundWindow);
+    require!(
+        ends_at
+            .checked_sub(starts_at)
+            .ok_or(TickError::InvalidRoundWindow)?
+            == pool.duration_seconds,
+        TickError::InvalidRoundWindow
+    );
+
+    round.pool = pool.key();
+    round.round_id = round_id;
+    round.start_price = start_price;
+    round.final_price = 0;
+    round.starts_at = starts_at;
+    round.ends_at = ends_at;
+    round.status = RoundStatus::Open;
+    round.winning_tile_index = u8::MAX;
+    round.tile_width_bps = price_axis_range(&pool.symbol)?
+        .checked_div(TILE_COUNT as i64)
+        .ok_or(TickError::MathOverflow)?;
+    round.multipliers_bps = MULTIPLIER_BPS;
+    round.bump = bump;
+
+    Ok(())
 }
 
 fn price_axis_range(symbol: &[u8; SYMBOL_BYTES]) -> Result<i64> {

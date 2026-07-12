@@ -205,6 +205,83 @@ describe('tick_prediction', () => {
     )
   })
 
+  it('funds a prediction on base layer and selects the tile without a second stake transfer', async () => {
+    const symbol = 'ETH'
+    const pool = poolPda(symbol)
+    const vault = vaultPda(pool)
+    const roundId = new BN(30)
+    const round = roundPda(pool, roundId)
+    const prediction = predictionPda(round, user.publicKey)
+    const sessionAuthority = anchor.web3.Keypair.generate()
+    const now = await getValidatorNow()
+    const vaultBefore = await getAccount(provider.connection, vault)
+
+    await program.methods
+      .openRound(roundId, new BN(331_244), new BN(now), new BN(now + 4))
+      .accounts({ authority, pool, round })
+      .rpc()
+
+    await program.methods
+      .fundPrediction()
+      .accounts({
+        payer: user.publicKey,
+        pool,
+        prediction,
+        predictor: user.publicKey,
+        predictorTokenAccount: userUsdc,
+        round,
+        sessionAuthority: sessionAuthority.publicKey,
+        tokenProgram: TOKEN_PROGRAM_ID,
+        usdcMint,
+        vault,
+      })
+      .signers([user])
+      .rpc()
+
+    const vaultAfterFunding = await getAccount(provider.connection, vault)
+    let predictionAccount = await program.account.tilePrediction.fetch(prediction)
+
+    assert.equal(Number(vaultAfterFunding.amount - vaultBefore.amount), 1_000_000)
+    assert.equal(predictionAccount.tileIndex, 255)
+    assert.equal(predictionAccount.multiplierBps, 0)
+    assert.equal(predictionAccount.predictor.toBase58(), user.publicKey.toBase58())
+    assert.equal(predictionAccount.sessionAuthority.toBase58(), sessionAuthority.publicKey.toBase58())
+
+    await program.methods
+      .selectTileOnEr(2)
+      .accounts({
+        pool,
+        prediction,
+        predictor: user.publicKey,
+        round,
+        sessionAuthority: sessionAuthority.publicKey,
+      })
+      .signers([sessionAuthority])
+      .rpc()
+
+    const vaultAfterSelection = await getAccount(provider.connection, vault)
+    predictionAccount = await program.account.tilePrediction.fetch(prediction)
+
+    assert.equal(vaultAfterSelection.amount.toString(), vaultAfterFunding.amount.toString())
+    assert.equal(predictionAccount.tileIndex, 2)
+    assert.equal(predictionAccount.multiplierBps, 1_250)
+
+    await expectRejects(
+      program.methods
+        .selectTileOnEr(3)
+        .accounts({
+          pool,
+          prediction,
+          predictor: user.publicKey,
+          round,
+          sessionAuthority: sessionAuthority.publicKey,
+        })
+        .signers([sessionAuthority])
+        .rpc(),
+      'expected duplicate ER tile selection to fail',
+    )
+  })
+
   it('rejects prediction after the prediction window', async () => {
     const symbol = 'BTC'
     const pool = poolPda(symbol)

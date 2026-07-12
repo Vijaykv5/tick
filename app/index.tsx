@@ -28,15 +28,26 @@ import Clipboard from '@react-native-clipboard/clipboard'
 import { Ionicons } from '@expo/vector-icons'
 import { getWalletAddress, getWalletAvatar, isWalletConnected, shortenAddress } from '@/utils/wallet'
 import { address as solanaAddress, type Instruction } from '@solana/kit'
+import { Connection, Keypair, Transaction } from '@solana/web3.js'
 import {
   getClaimPayoutInstruction,
   getCreateUserUsdcAccountInstruction,
+  getAuthorizePoolSessionInstruction,
+  getDelegatePredictionInstruction,
+  getDelegateRoundInstruction,
+  getFundPredictionInstruction,
   getInitializePoolInstruction,
   getOpenRoundInstruction,
+  getOpenRoundWithSessionInstruction,
   getPlaceTilePredictionInstruction,
+  getSelectTileOnErInstruction,
   getSettleRoundInstruction,
   getTickPredictionAddresses,
+  getTransferUsdcInstruction,
+  getUndelegatePredictionInstruction,
+  getUndelegateRoundInstruction,
   getUserTokenAccountAddress,
+  kitInstructionToWeb3Instruction,
   TILE_MULTIPLIERS_BPS,
   TILE_STAKE_BASE_UNITS,
   TILE_STAKE_USDC,
@@ -110,6 +121,12 @@ type PoolPrediction = {
   winningTileIndex?: number
 }
 
+type PreparedPrediction = {
+  authorityAddress: string
+  expiresAtMs: number
+  sessionKeypair: Keypair
+}
+
 type ResultFeedback = {
   message: string
   title: string
@@ -139,10 +156,14 @@ const CHART_PADDING = 22
 const CHART_AXIS_WIDTH = 70
 const ROUND_DURATION_MS = 60_000
 const PREDICTION_WINDOW_MS = 30_000
+const PREDICTION_WALLET_CONFIRM_BUFFER_MS = 8_000
 const FALLBACK_POINT_STEP_MS = 1_000
 const TILE_SIZE = 24
 const TILE_BUTTON_GAP = 2
 const RESULT_FEEDBACK_MS = 2000
+const MAGICBLOCK_SESSION_FEE_LAMPORTS = 200_000_000
+const MAGICBLOCK_MIN_SESSION_LAMPORTS = 20_000_000
+const MAGICBLOCK_SESSION_PREDICTION_CREDITS = 5n
 const WIN_VIBRATION_PATTERN = [0, 420, 220, 420, 220, 420, 300]
 const LOSE_VIBRATION_PATTERN = [0, 180, 120, 180, 120, 180, 1220]
 const PRICE_AXIS_RANGE_BY_POOL: Record<Pool['id'], number> = {
@@ -502,7 +523,7 @@ function clearPoolPrediction(
 }
 
 function getPredictionRouteLabel() {
-  return AppConfig.magicBlock.erRpcUrl ? 'Devnet wallet tx' : 'Devnet wallet tx'
+  return AppConfig.magicBlock.enabled ? 'MagicBlock ER' : 'Devnet wallet tx'
 }
 
 function isUserCancelledError(error: unknown) {
@@ -582,8 +603,10 @@ export default function HomeScreen() {
   const [selectedPool, setSelectedPool] = useState<Pool | null>(null)
   const [poolMarketData, setPoolMarketData] = useState<Partial<Record<Pool['id'], PoolMarketData>>>({})
   const [poolPredictions, setPoolPredictions] = useState<Partial<Record<Pool['id'], PoolPrediction>>>({})
+  const [preparedPredictions, setPreparedPredictions] = useState<Partial<Record<Pool['id'], PreparedPrediction>>>({})
   const [predictionStatus, setPredictionStatus] = useState('')
   const [pendingTileIndex, setPendingTileIndex] = useState<number | null>(null)
+  const [preparePendingPoolId, setPreparePendingPoolId] = useState<Pool['id'] | null>(null)
   const [claimPendingRoundId, setClaimPendingRoundId] = useState<bigint | null>(null)
   const [resultFeedback, setResultFeedback] = useState<ResultFeedback | null>(null)
   const [nowMs, setNowMs] = useState(() => Date.now())
@@ -634,6 +657,7 @@ export default function HomeScreen() {
   useEffect(() => {
     setPredictionStatus('')
     setPendingTileIndex(null)
+    setPreparePendingPoolId(null)
   }, [selectedPool])
 
   useEffect(() => {
@@ -662,6 +686,7 @@ export default function HomeScreen() {
   const roundRemainingMs = roundEndMs - nowMs
   const roundElapsedMs = nowMs - roundStartMs
   const predictionOpen = roundElapsedMs < PREDICTION_WINDOW_MS
+  const predictionWalletOpen = roundElapsedMs < PREDICTION_WINDOW_MS - PREDICTION_WALLET_CONFIRM_BUFFER_MS
 
   useEffect(() => {
     let mounted = true
@@ -765,6 +790,9 @@ export default function HomeScreen() {
       : getFallbackChartPoints([selectedPool.currentPrice], roundStartMs)
     : []
   const activePrediction = selectedPool ? poolPredictions[selectedPool.id] : undefined
+  const preparedPrediction = selectedPool ? preparedPredictions[selectedPool.id] : undefined
+  const magicBlockPredictionReady =
+    AppConfig.magicBlock.enabled && Boolean(preparedPrediction && preparedPrediction.expiresAtMs > nowMs)
   const currentRoundStartPrice = selectedPoolChartPoints[0]?.price ?? selectedPoolPrice
   const roundStartPrice = activePrediction?.roundStartPrice ?? currentRoundStartPrice
   const chartRangeValues = getChartRangeValues(selectedPoolChartPoints)
@@ -937,14 +965,328 @@ export default function HomeScreen() {
     disconnect()
   }
 
-  async function placeTilePrediction(tileIndex: number) {
+  async function sendSessionInstructions(instructions: Instruction[], sessionKeypair: Keypair, rpcUrl: string) {
+    const connection = new Connection(rpcUrl, 'confirmed')
+    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash()
+    const transaction = new Transaction({
+      feePayer: sessionKeypair.publicKey,
+      recentBlockhash: blockhash,
+    }).add(...instructions.map(kitInstructionToWeb3Instruction))
+
+    transaction.sign(sessionKeypair)
+    const signature = await connection.sendRawTransaction(transaction.serialize(), {
+      skipPreflight: false,
+    })
+
+    await connection.confirmTransaction({ blockhash, lastValidBlockHeight, signature }, 'confirmed')
+    return signature
+  }
+
+  async function sendMagicBlockErInstruction(instruction: Instruction, sessionKeypair: Keypair) {
+    return sendSessionInstructions([instruction], sessionKeypair, AppConfig.magicBlock.routerRpcUrl || AppConfig.solanaDevnetRpcUrl)
+  }
+
+  async function fundSessionSolOnDevnet(sessionKeypair: Keypair) {
+    const connection = new Connection(AppConfig.solanaDevnetRpcUrl, 'confirmed')
+    const balance = await connection.getBalance(sessionKeypair.publicKey)
+
+    if (balance >= MAGICBLOCK_MIN_SESSION_LAMPORTS) {
+      return
+    }
+
+    const signature = await connection.requestAirdrop(sessionKeypair.publicKey, MAGICBLOCK_SESSION_FEE_LAMPORTS)
+    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash()
+    await connection.confirmTransaction({ blockhash, lastValidBlockHeight, signature }, 'confirmed')
+  }
+
+  async function prepareMagicBlockPrediction() {
     const activePool = selectedPool
+
+    if (
+      !activePool ||
+      !AppConfig.magicBlock.enabled ||
+      preparePendingPoolId !== null ||
+      (activePrediction && !activePredictionSettled)
+    ) {
+      return
+    }
+
+    if (magicBlockPredictionReady) {
+      setPredictionStatus('MagicBlock session ready. Tap tiles in this or future rounds.')
+      return
+    }
+
+    setPreparePendingPoolId(activePool.id)
+    setPredictionStatus('Opening wallet to pre-fund a reusable MagicBlock session...')
+
+    try {
+      const usdcMintAddress = getConfiguredUsdcMint()
+      const walletAccount = account ?? (await connect())
+      const predictorAddress = getWalletAddress(walletAccount)
+
+      if (!predictorAddress) {
+        throw new Error('Wallet connection did not return an address.')
+      }
+
+      const programAccount = await client.rpc
+        .getAccountInfo(solanaAddress(TICK_PREDICTION_PROGRAM_ID), { encoding: 'base64' })
+        .send()
+
+      if (!programAccount.value) {
+        throw new Error('Tick is not deployed on devnet. Deploy the program before using MagicBlock.')
+      }
+
+      const sessionKeypair = Keypair.generate()
+      const sessionAuthorityAddress = sessionKeypair.publicKey.toBase58()
+      const sessionExpiresAtMs = Date.now() + AppConfig.magicBlock.sessionTtlSeconds * 1000
+      try {
+        await fundSessionSolOnDevnet(sessionKeypair)
+      } catch (error) {
+        throw new Error(
+          `Could not fund the MagicBlock session with devnet SOL. Try again in a moment. ${
+            error instanceof Error ? error.message : ''
+          }`.trim(),
+        )
+      }
+
+      const addresses = getTickPredictionAddresses(activePool.symbol, predictorAddress, BigInt(roundStartMs), usdcMintAddress)
+      const sessionUsdcAccountAddress = getUserTokenAccountAddress(sessionAuthorityAddress, usdcMintAddress)
+      const poolAccount = await client.rpc.getAccountInfo(solanaAddress(addresses.pool), { encoding: 'base64' }).send()
+      const usdcMintAccount = await client.rpc
+        .getAccountInfo(solanaAddress(usdcMintAddress), { encoding: 'base64' })
+        .send()
+      const userUsdcAccount = addresses.predictorTokenAccount
+        ? await client.rpc.getAccountInfo(solanaAddress(addresses.predictorTokenAccount), { encoding: 'base64' }).send()
+        : null
+      const sessionUsdcAccount = await client.rpc
+        .getAccountInfo(solanaAddress(sessionUsdcAccountAddress), { encoding: 'base64' })
+        .send()
+      const instructions: Instruction[] = []
+
+      if (!addresses.predictorTokenAccount) {
+        throw new Error('Could not derive your USDC token account.')
+      }
+
+      const usdcDecimals = getSplMintDecimals(usdcMintAccount.value)
+
+      if (usdcDecimals !== 6) {
+        throw new Error(
+          `EXPO_PUBLIC_DEVNET_USDC_MINT must be a 6-decimal devnet token. Current mint has ${
+            usdcDecimals ?? 'unknown'
+          } decimals.`,
+        )
+      }
+
+      if (!userUsdcAccount?.value) {
+        throw new Error(
+          `Your wallet needs devnet USDC for this game. Create and mint at least $1 of ${shortenAddress(
+            usdcMintAddress,
+            6,
+          )} before predicting.`,
+        )
+      }
+
+      const sessionStakeAmount = TILE_STAKE_BASE_UNITS * MAGICBLOCK_SESSION_PREDICTION_CREDITS
+
+      if (getSplTokenAccountAmount(userUsdcAccount.value) < sessionStakeAmount) {
+        throw new Error(
+          `Your devnet USDC balance is below ${formatUsdcBaseUnits(
+            sessionStakeAmount,
+          )}. Mint more ${shortenAddress(usdcMintAddress, 6)} before starting a MagicBlock session.`,
+        )
+      }
+
+      if (!poolAccount.value) {
+        instructions.push(
+          getInitializePoolInstruction({
+            authorityAddress: predictorAddress,
+            symbol: activePool.symbol,
+            usdcMintAddress,
+          }),
+        )
+      }
+
+      if (!sessionUsdcAccount.value) {
+        instructions.push(
+          getCreateUserUsdcAccountInstruction({
+            ownerAddress: sessionAuthorityAddress,
+            payerAddress: predictorAddress,
+            usdcMintAddress,
+          }),
+        )
+      }
+
+      instructions.push(
+        getTransferUsdcInstruction({
+          amount: sessionStakeAmount,
+          authorityAddress: predictorAddress,
+          destinationOwnerAddress: sessionAuthorityAddress,
+          sourceOwnerAddress: predictorAddress,
+          usdcMintAddress,
+        }),
+        getAuthorizePoolSessionInstruction({
+          authorityAddress: predictorAddress,
+          expiresAt: BigInt(Math.floor(sessionExpiresAtMs / 1000)),
+          sessionAuthorityAddress,
+          symbol: activePool.symbol,
+        }),
+      )
+
+      const signature = await sendTransactions(instructions)
+
+      setPreparedPredictions((predictions) => ({
+        ...predictions,
+        [activePool.id]: {
+          authorityAddress: predictorAddress,
+          expiresAtMs: sessionExpiresAtMs,
+          sessionKeypair,
+        },
+      }))
+      setPredictionStatus(`MagicBlock session funded for ${MAGICBLOCK_SESSION_PREDICTION_CREDITS} rounds: ${shortenAddress(signature, 6)}`)
+    } catch (error) {
+      if (isUserCancelledError(error)) {
+        return
+      }
+
+      const message = error instanceof Error ? error.message : 'Could not prepare MagicBlock prediction.'
+      setPredictionStatus(message)
+    } finally {
+      setPreparePendingPoolId(null)
+    }
+  }
+
+  async function selectMagicBlockTile(tileIndex: number) {
+    const activePool = selectedPool
+    const prepared = selectedPool ? preparedPredictions[selectedPool.id] : undefined
+
     if (!activePool || pendingTileIndex !== null || (activePrediction && !activePredictionSettled)) {
       return
     }
 
     if (!predictionOpen) {
       setPredictionStatus('Prediction is closed for this round. Settlement is in progress.')
+      return
+    }
+
+    if (!prepared || prepared.expiresAtMs <= nowMs) {
+      setPredictionStatus('Press Predict once to start a reusable MagicBlock session.')
+      return
+    }
+
+    setPendingTileIndex(tileIndex)
+    setPredictionStatus('Funding this round from your MagicBlock session...')
+
+    try {
+      const usdcMintAddress = getConfiguredUsdcMint()
+      const predictorAddress = prepared.authorityAddress
+      const sessionAuthorityAddress = prepared.sessionKeypair.publicKey.toBase58()
+      const sessionSolBalance = await client.rpc.getBalance(solanaAddress(sessionAuthorityAddress)).send()
+
+      if (sessionSolBalance.value < BigInt(MAGICBLOCK_MIN_SESSION_LAMPORTS)) {
+        setPreparedPredictions((predictions) => ({
+          ...predictions,
+          [activePool.id]: undefined,
+        }))
+        throw new Error('MagicBlock session balance is low. Press Predict once to refresh the session.')
+      }
+
+      const activeMarketData = poolMarketData[activePool.id]
+      const activePrice = activeMarketData?.price ?? activePool.currentPrice
+      const roundStartPrice = activeMarketData?.chartPoints[0]?.price ?? activePrice
+      const roundId = BigInt(roundStartMs)
+      const startsAt = BigInt(Math.floor(roundStartMs / 1000))
+      const endsAt = BigInt(Math.floor(roundEndMs / 1000))
+      const addresses = getTickPredictionAddresses(activePool.symbol, predictorAddress, roundId, usdcMintAddress)
+      const roundAccount = await client.rpc
+        .getAccountInfo(solanaAddress(addresses.round), { encoding: 'base64' })
+        .send()
+      const setupInstructions: Instruction[] = []
+
+      if (!roundAccount.value) {
+        setupInstructions.push(
+          getOpenRoundWithSessionInstruction({
+            authorityAddress: predictorAddress,
+            endsAt,
+            roundId,
+            sessionAuthorityAddress,
+            startPrice: getPoolStartPrice(roundStartPrice),
+            startsAt,
+            symbol: activePool.symbol,
+          }),
+        )
+      }
+
+      setupInstructions.push(
+        getFundPredictionInstruction({
+          payerAddress: sessionAuthorityAddress,
+          predictorAddress,
+          roundId,
+          sessionAuthorityAddress,
+          symbol: activePool.symbol,
+          usdcMintAddress,
+        }),
+        getDelegatePredictionInstruction({
+          payerAddress: sessionAuthorityAddress,
+          predictorAddress,
+          roundId,
+          symbol: activePool.symbol,
+          validatorAddress: AppConfig.magicBlock.erValidator,
+        }),
+      )
+
+      if (!roundAccount.value) {
+        setupInstructions.push(
+          getDelegateRoundInstruction({
+            payerAddress: sessionAuthorityAddress,
+            roundId,
+            symbol: activePool.symbol,
+            validatorAddress: AppConfig.magicBlock.erValidator,
+          }),
+        )
+      }
+
+      await sendSessionInstructions(setupInstructions, prepared.sessionKeypair, AppConfig.solanaDevnetRpcUrl)
+      setPredictionStatus('Sending tile to MagicBlock...')
+
+      const signature = await sendMagicBlockErInstruction(
+        getSelectTileOnErInstruction({
+          predictorAddress,
+          roundId,
+          sessionAuthorityAddress,
+          symbol: activePool.symbol,
+          tileIndex,
+        }),
+        prepared.sessionKeypair,
+      )
+
+      setPoolPredictions((predictions) => ({
+        ...predictions,
+        [activePool.id]: {
+          multiplierBps: TILE_MULTIPLIERS_BPS[tileIndex],
+          roundId,
+          roundStartPrice,
+          tileIndex,
+        },
+      }))
+      setPredictionStatus(
+        `${formatMultiplier(TILE_MULTIPLIERS_BPS[tileIndex])} locked via MagicBlock: ${shortenAddress(signature, 6)}`,
+      )
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Could not select tile on MagicBlock.'
+      setPredictionStatus(message)
+    } finally {
+      setPendingTileIndex(null)
+    }
+  }
+
+  async function placeTilePrediction(tileIndex: number) {
+    const activePool = selectedPool
+    if (!activePool || pendingTileIndex !== null || (activePrediction && !activePredictionSettled)) {
+      return
+    }
+
+    if (!predictionWalletOpen) {
+      setPredictionStatus('This round is almost closed. Wait a few seconds for the next prediction window.')
       return
     }
 
@@ -1061,7 +1403,10 @@ export default function HomeScreen() {
         },
       }))
       setPredictionStatus(
-        `${formatMultiplier(TILE_MULTIPLIERS_BPS[tileIndex])} placed for $1: ${shortenAddress(signature, 6)}`,
+        `${formatMultiplier(TILE_MULTIPLIERS_BPS[tileIndex])} placed for $1 via ${getPredictionRouteLabel()}: ${shortenAddress(
+          signature,
+          6,
+        )}`,
       )
     } catch (error) {
       if (isUserCancelledError(error)) {
@@ -1073,6 +1418,15 @@ export default function HomeScreen() {
     } finally {
       setPendingTileIndex(null)
     }
+  }
+
+  async function handleTilePress(tileIndex: number) {
+    if (AppConfig.magicBlock.enabled) {
+      await selectMagicBlockTile(tileIndex)
+      return
+    }
+
+    await placeTilePrediction(tileIndex)
   }
 
   const claimTilePayout = useCallback(async () => {
@@ -1139,6 +1493,23 @@ export default function HomeScreen() {
             activePredictionPayoutBaseUnits,
           )}. Seed the ${activePool.symbol} vault before claiming.`,
         )
+      }
+
+      if (AppConfig.magicBlock.enabled) {
+        setPredictionStatus('Committing your MagicBlock prediction back to Solana...')
+        await sendTransactions([
+          getUndelegatePredictionInstruction({
+            claimantAddress,
+            payerAddress: claimantAddress,
+            roundId: prediction.roundId,
+            symbol: activePool.symbol,
+          }),
+          getUndelegateRoundInstruction({
+            payerAddress: claimantAddress,
+            roundId: prediction.roundId,
+            symbol: activePool.symbol,
+          }),
+        ])
       }
 
       instructions.push(
@@ -1414,7 +1785,9 @@ export default function HomeScreen() {
                       const tileDisabled =
                         !predictionOpen ||
                         Boolean(activePrediction && !activePredictionSettled) ||
-                        pendingTileIndex !== null
+                        pendingTileIndex !== null ||
+                        preparePendingPoolId !== null ||
+                        (AppConfig.magicBlock.enabled && !magicBlockPredictionReady)
 
                       return (
                         <Pressable
@@ -1422,7 +1795,7 @@ export default function HomeScreen() {
                           accessibilityRole="button"
                           disabled={tileDisabled}
                           key={`tile-${tileIndex}`}
-                          onPress={() => placeTilePrediction(tileIndex)}
+                          onPress={() => handleTilePress(tileIndex)}
                           style={({ pressed }) => [
                             appStyles.tileButton,
                             tileLayout,
@@ -1481,6 +1854,26 @@ export default function HomeScreen() {
                       <Text style={appStyles.tileSummaryValue}>{getPredictionRouteLabel()}</Text>
                     </View>
                   </View>
+                  {AppConfig.magicBlock.enabled && !activePrediction ? (
+                    <Pressable
+                      accessibilityRole="button"
+                      disabled={magicBlockPredictionReady || preparePendingPoolId !== null}
+                      onPress={prepareMagicBlockPrediction}
+                      style={({ pressed }) => [
+                        appStyles.claimButton,
+                        pressed && appStyles.buttonPressed,
+                        (magicBlockPredictionReady || preparePendingPoolId !== null) && appStyles.tileButtonDisabled,
+                      ]}
+                    >
+                      <Text style={appStyles.claimButtonText}>
+                        {preparePendingPoolId === selectedPool.id
+                          ? 'PREPARING...'
+                          : magicBlockPredictionReady
+                            ? 'READY'
+                            : 'PREDICT'}
+                      </Text>
+                    </Pressable>
+                  ) : null}
                   {activePrediction ? (
                     <View
                       style={[
@@ -1532,7 +1925,11 @@ export default function HomeScreen() {
                     </View>
                   ) : (
                     <Text style={appStyles.predictionStatus}>
-                      {predictionOpen ? 'Tap one settlement tile before 30 seconds.' : 'Prediction window closed.'}
+                      {predictionOpen
+                        ? AppConfig.magicBlock.enabled && !magicBlockPredictionReady
+                          ? 'Press Predict once, then tap tiles across rounds.'
+                          : 'Tap one settlement tile before 30 seconds.'
+                        : 'Prediction window closed.'}
                     </Text>
                   )}
                   {predictionStatus ? <Text style={appStyles.predictionStatus}>{predictionStatus}</Text> : null}
