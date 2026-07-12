@@ -5,10 +5,10 @@
 <h1 align="center">Tick</h1>
 
 <p align="center">
-  Fast mobile prediction markets on Solana devnet, powered by Anchor and MagicBlock Ephemeral Rollups.
+  A mobile precision market on Solana for fast BTC, SOL and ETH tile predictions using devnet USDC, Anchor and MagicBlock Ephemeral Rollups.
 </p>
 
-Tick is a mobile-first Solana prediction market app built with Expo, React Native, Solana Kit, Anchor, SPL Token, and MagicBlock Ephemeral Rollups.
+Tick is a mobile precision market on Solana for fast BTC, SOL and ETH tile predictions using devnet USDC, Anchor and MagicBlock Ephemeral Rollups.
 
 Users pick a crypto market, press **Predict** once to prepare a reusable fast prediction session, then tap a settlement tile during the prediction window. USDC staking and payout settlement stay on Solana devnet, while fast tile selection can run through MagicBlock ER when enabled.
 
