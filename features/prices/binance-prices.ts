@@ -31,8 +31,12 @@ const POOL_BY_BINANCE_SYMBOL = Object.entries(BINANCE_SYMBOL_BY_POOL).reduce<Rec
 
 const BINANCE_REST_ENDPOINT = 'https://api.binance.com'
 const BINANCE_WS_ENDPOINT = 'wss://stream.binance.com:9443/stream'
+const COINBASE_REST_ENDPOINT = 'https://api.coinbase.com'
+const COINBASE_WS_ENDPOINT = 'wss://ws-feed.exchange.coinbase.com'
 const CHART_POINT_LIMIT = 720
 const ONE_SECOND_MS = 1_000
+const FALLBACK_PRICE_POLL_MS = 3_000
+const FALLBACK_START_DELAY_MS = 4_000
 
 type BinanceKline = [number, string, string, string, string, string, number, string, number, string, string, string]
 
@@ -41,6 +45,32 @@ type BinanceTradeMessage = {
     p?: string
     s?: string
   }
+}
+
+const COINBASE_PRODUCT_BY_POOL: Record<BinancePoolId, string> = {
+  btc: 'BTC-USD',
+  eth: 'ETH-USD',
+  sol: 'SOL-USD',
+}
+
+const POOL_BY_COINBASE_PRODUCT = Object.entries(COINBASE_PRODUCT_BY_POOL).reduce<Record<string, BinancePoolId>>(
+  (poolByProduct, [poolId, productId]) => ({
+    ...poolByProduct,
+    [productId]: poolId as BinancePoolId,
+  }),
+  {},
+)
+
+type CoinbaseSpotResponse = {
+  data?: {
+    amount?: string
+  }
+}
+
+type CoinbaseTickerMessage = {
+  price?: string
+  product_id?: string
+  type?: string
 }
 
 function parsePrice(value: string | undefined): number | null {
@@ -74,6 +104,14 @@ export async function fetchBinancePriceHistory(
   poolId: BinancePoolId,
   roundStartMs: number,
 ): Promise<BinancePriceHistory> {
+  try {
+    return await fetchBinanceKlineHistory(poolId, roundStartMs)
+  } catch {
+    return fetchCoinbasePriceHistory(poolId, roundStartMs)
+  }
+}
+
+async function fetchBinanceKlineHistory(poolId: BinancePoolId, roundStartMs: number): Promise<BinancePriceHistory> {
   const symbol = BINANCE_SYMBOL_BY_POOL[poolId]
   const response = await fetch(
     `${BINANCE_REST_ENDPOINT}/api/v3/klines?symbol=${symbol}&interval=1s&startTime=${roundStartMs}&endTime=${roundStartMs + 59999}&limit=${CHART_POINT_LIMIT}`,
@@ -103,6 +141,49 @@ export async function fetchBinancePriceHistory(
   }
 }
 
+async function fetchCoinbaseSpotPrice(poolId: BinancePoolId) {
+  const productId = COINBASE_PRODUCT_BY_POOL[poolId]
+  const response = await fetch(`${COINBASE_REST_ENDPOINT}/v2/prices/${productId}/spot`)
+
+  if (!response.ok) {
+    throw new Error(`Coinbase spot request failed for ${productId}.`)
+  }
+
+  const payload = (await response.json()) as CoinbaseSpotResponse
+  const price = parsePrice(payload.data?.amount)
+
+  if (!price) {
+    throw new Error(`Coinbase returned no usable spot price for ${productId}.`)
+  }
+
+  return price
+}
+
+async function fetchCoinbasePriceHistory(
+  poolId: BinancePoolId,
+  roundStartMs: number,
+): Promise<BinancePriceHistory> {
+  const price = await fetchCoinbaseSpotPrice(poolId)
+  const now = Date.now()
+  const chartPoints = [
+    {
+      price,
+      timestamp: roundStartMs,
+    },
+    {
+      price,
+      timestamp: Math.max(roundStartMs, now),
+    },
+  ]
+
+  return {
+    chartPoints,
+    id: poolId,
+    price,
+    timestamp: now,
+  }
+}
+
 export async function fetchBinancePriceHistories(poolIds: BinancePoolId[], roundStartMs: number) {
   const histories = await Promise.allSettled(poolIds.map((poolId) => fetchBinancePriceHistory(poolId, roundStartMs)))
 
@@ -122,10 +203,77 @@ export function subscribeToBinanceTrades({
   onError?: (error: Event) => void
   onPrice: (pricePoint: BinancePricePoint) => void
 }) {
+  let fallbackStarted = false
+  let fallbackPollTimer: ReturnType<typeof setInterval> | null = null
+  let fallbackSocket: WebSocket | null = null
+  let receivedBinanceTick = false
   const streams = Object.values(BINANCE_SYMBOL_BY_POOL)
     .map((symbol) => `${symbol.toLowerCase()}@trade`)
     .join('/')
   const socket = new WebSocket(`${BINANCE_WS_ENDPOINT}?streams=${streams}`)
+  const fallbackStartTimer = setTimeout(() => {
+    if (!receivedBinanceTick) {
+      startCoinbaseFallback()
+    }
+  }, FALLBACK_START_DELAY_MS)
+
+  function emitCoinbasePrice(poolId: BinancePoolId, price: number) {
+    onPrice({ id: poolId, price, timestamp: Date.now() })
+  }
+
+  function pollCoinbasePrices() {
+    Object.keys(COINBASE_PRODUCT_BY_POOL).forEach((poolId) => {
+      fetchCoinbaseSpotPrice(poolId as BinancePoolId)
+        .then((price) => emitCoinbasePrice(poolId as BinancePoolId, price))
+        .catch(() => undefined)
+    })
+  }
+
+  function startCoinbaseFallback() {
+    if (fallbackStarted) {
+      return
+    }
+
+    fallbackStarted = true
+    pollCoinbasePrices()
+    fallbackPollTimer = setInterval(pollCoinbasePrices, FALLBACK_PRICE_POLL_MS)
+    fallbackSocket = new WebSocket(COINBASE_WS_ENDPOINT)
+
+    fallbackSocket.onopen = () => {
+      fallbackSocket?.send(
+        JSON.stringify({
+          channels: [
+            {
+              name: 'ticker',
+              product_ids: Object.values(COINBASE_PRODUCT_BY_POOL),
+            },
+          ],
+          type: 'subscribe',
+        }),
+      )
+    }
+
+    fallbackSocket.onmessage = (event) => {
+      try {
+        const message = JSON.parse(event.data) as CoinbaseTickerMessage
+
+        if (message.type !== 'ticker') {
+          return
+        }
+
+        const poolId = message.product_id ? POOL_BY_COINBASE_PRODUCT[message.product_id] : undefined
+        const price = parsePrice(message.price)
+
+        if (!poolId || !price) {
+          return
+        }
+
+        emitCoinbasePrice(poolId, price)
+      } catch {
+        // Ignore malformed fallback payloads and keep the REST poller running.
+      }
+    }
+  }
 
   socket.onmessage = (event) => {
     try {
@@ -138,6 +286,7 @@ export function subscribeToBinanceTrades({
         return
       }
 
+      receivedBinanceTick = true
       onPrice({ id: poolId, price, timestamp: Date.now() })
     } catch {
       // Ignore malformed stream payloads and wait for the next trade tick.
@@ -146,9 +295,19 @@ export function subscribeToBinanceTrades({
 
   socket.onerror = (event) => {
     onError?.(event)
+    startCoinbaseFallback()
+  }
+
+  socket.onclose = () => {
+    startCoinbaseFallback()
   }
 
   return () => {
+    clearTimeout(fallbackStartTimer)
+    if (fallbackPollTimer) {
+      clearInterval(fallbackPollTimer)
+    }
+    fallbackSocket?.close()
     socket.close()
   }
 }
